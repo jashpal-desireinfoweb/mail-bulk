@@ -561,79 +561,18 @@ apiRouter.post('/uploads/:id/send-batch', batchLimiter, catchAsync(async (req, r
     return res.status(200).json({ sent: 0, failed: 0 });
   }
 
-  // Templates are compiled once per batch — cache handles cross-batch reuse
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-
-  const results = [];
-  for (const contact of contacts) {
-    const token = crypto
-      .createHash('sha256')
-      .update(contact.email + 'desire-unsubscribe-salt')
-      .digest('hex')
-      .substring(0, 32);
-    const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
-
-    const variables = { name: contact.name, email: contact.email, unsubscribeLink };
-    const rendered = renderTemplate(
-      { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
-      variables
-    );
-
-    let attempts = 0;
-    const maxAttempts = 3;
-    let lastError = null;
-    let sentSuccessfully = false;
-
-    while (attempts < maxAttempts) {
-      try {
-        await sendEmail({ to: contact.email, subject: rendered.subject, html: rendered.html, text: rendered.text });
-        await prisma.contact.update({
-          where: { id: contact.id },
-          data: { deliveryStatus: 'sent', deliveryError: null, sentAt: new Date() },
-        });
-        results.push({ id: contact.id, status: 'sent' });
-        sentSuccessfully = true;
-        break;
-      } catch (err) {
-        attempts++;
-        lastError = err;
-        console.warn(`[Retry] Attempt ${attempts} failed for ${contact.email}: ${err.message}`);
-        if (attempts < maxAttempts) await new Promise((r) => setTimeout(r, 2000));
-      }
-    }
-
-    if (!sentSuccessfully) {
-      await prisma.contact.update({
-        where: { id: contact.id },
-        data: {
-          deliveryStatus: 'failed',
-          deliveryError: lastError?.message || 'All retry attempts failed',
-          sentAt: new Date(),
-        },
-      });
-      results.push({ id: contact.id, status: 'failed' });
-    }
-
-    // Add individual email sending delay to honor rate limits
-    await new Promise((r) => setTimeout(r, getRandomIndividualDelayMs()));
-  }
-
-  let sentCount = 0, failedCount = 0;
-  for (const r of results) {
-    if (r.status === 'sent') sentCount++;
-    if (r.status === 'failed') failedCount++;
-  }
-
+  // Update campaign upload status to 'processing' and assign template
   await prisma.upload.update({
     where: { id },
-    data: {
-      sentCount: { increment: sentCount },
-      failedCount: { increment: failedCount },
-      pendingCount: { decrement: contacts.length },
-    },
+    data: { status: 'processing', templateId },
   });
 
-  return res.status(200).json({ sent: sentCount, failed: failedCount });
+  // Launch campaign processing asynchronously in background to prevent HTTP gateway timeout
+  runCampaignInBackground(id, templateId).catch((err) => {
+    console.error(`[Background Scheduler] Error processing campaign ${id}:`, err);
+  });
+
+  return res.status(200).json({ sent: 0, failed: 0, status: 'processing', message: 'Campaign started in background' });
 }));
 
 // POST /uploads/:id/finalize
