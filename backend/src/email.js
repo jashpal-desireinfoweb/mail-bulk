@@ -11,8 +11,8 @@ const SMTP_PASS = process.env.SMTP_PASS || '';
 const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || 'Desire Mail';
 
 // Initialize Azure Communication Services Email Client
-const isAzureConfigured = 
-  AZURE_COMMUNICATION_CONNECTION_STRING && 
+const isAzureConfigured =
+  AZURE_COMMUNICATION_CONNECTION_STRING &&
   AZURE_COMMUNICATION_CONNECTION_STRING.trim() !== '' &&
   !AZURE_COMMUNICATION_CONNECTION_STRING.includes('your-resource');
 
@@ -62,7 +62,7 @@ async function sendViaAzure(options) {
 
 async function sendViaSMTP(options) {
   const fromAddress = SMTP_USER ? `${SMTP_FROM_NAME} <${SMTP_USER}>` : AZURE_COMMUNICATION_FROM_EMAIL;
-  
+
   try {
     const primaryTransporter = createDynamicTransporter(SMTP_HOST);
     const info = await primaryTransporter.sendMail({
@@ -92,46 +92,7 @@ async function sendViaSMTP(options) {
   }
 }
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const isResendConfigured = RESEND_API_KEY && RESEND_API_KEY.trim() !== '' && !RESEND_API_KEY.includes('your-key');
-
-async function sendViaResend(options) {
-  const fromAddress = process.env.RESEND_FROM_EMAIL || (SMTP_USER ? `${SMTP_FROM_NAME} <${SMTP_USER}>` : 'onboarding@resend.dev');
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${RESEND_API_KEY.trim()}`,
-    },
-    body: JSON.stringify({
-      from: fromAddress,
-      to: [options.to],
-      subject: options.subject,
-      html: options.html,
-      text: options.text,
-    }),
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(`Resend API error (${response.status}): ${data.message || JSON.stringify(data)}`);
-  }
-  return data.id || 'resend-ok';
-}
-
 async function sendEmail(options) {
-  if (isResendConfigured) {
-    try {
-      const messageId = await sendViaResend(options);
-      console.log(`Email sent via Resend HTTPS API to ${options.to}: ${messageId}`);
-      return { messageId, provider: 'resend' };
-    } catch (resendError) {
-      console.warn(
-        `Resend API failed for ${options.to}: ${resendError.message}. Falling back to next provider.`,
-      );
-    }
-  }
-
   if (isAzureConfigured) {
     try {
       const messageId = await sendViaAzure(options);
