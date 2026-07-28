@@ -19,16 +19,18 @@ const isAzureConfigured =
 const azureEmailClient = isAzureConfigured ? new EmailClient(AZURE_COMMUNICATION_CONNECTION_STRING) : null;
 
 // Initialize NodeMailer SMTP Transporter
-// Note: pool is set to false because 45s-70s delays cause Office 365 to close idle pooled TCP sockets, causing "Connection timeout"
+// Note: family: 4 forces IPv4 DNS resolution to prevent Azure/Render IPv6 connection blackholes.
+// pool is set to false to avoid idle socket drops during delay intervals.
 const smtpTransporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: SMTP_PORT,
   secure: SMTP_PORT === 465,
   requireTLS: SMTP_PORT === 587,
+  family: 4,               // Force IPv4 lookup to prevent Azure/Render IPv6 timeout issues
   pool: false,
-  connectionTimeout: 20000, // 20 seconds timeout for socket connection
-  greetingTimeout: 20000,   // 20 seconds timeout for SMTP greeting
-  socketTimeout: 30000,     // 30 seconds socket inactivity timeout
+  connectionTimeout: 30000, // 30 seconds timeout for socket connection
+  greetingTimeout: 30000,   // 30 seconds timeout for SMTP greeting
+  socketTimeout: 45000,     // 45 seconds socket inactivity timeout
   tls: {
     rejectUnauthorized: false,
   },

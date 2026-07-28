@@ -16,8 +16,8 @@ const EMAIL_BATCH_SIZE = parseInt(process.env.EMAIL_BATCH_SIZE || '1', 10);
 const EMAIL_BATCH_DELAY_MS = parseInt(process.env.EMAIL_BATCH_DELAY_MS || '0', 10);
 
 function getRandomIndividualDelayMs() {
-  const min = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MIN_MS || '120000', 10);
-  const max = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MAX_MS || '150000', 10);
+  const min = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MIN_MS || '15000', 10);
+  const max = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MAX_MS || '30000', 10);
   if (max <= min) return min;
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
