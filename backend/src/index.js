@@ -621,10 +621,13 @@ apiRouter.post('/uploads/:id/send-batch', batchLimiter, catchAsync(async (req, r
       results.push({ id: contact.id, status: 'failed' });
     }
 
-    // Small delay between batch emails on Vercel Serverless
-    const delayMs = getRandomIndividualDelayMs();
-    if (delayMs > 0 && delayMs <= 5000) {
-      await new Promise((r) => setTimeout(r, delayMs));
+    // Randomized human-like delay between individual emails (20s to 30s)
+    if (contacts.indexOf(contact) < contacts.length - 1) {
+      const delayMs = getRandomIndividualDelayMs();
+      if (delayMs > 0) {
+        console.log(`[Batch] Waiting human-like randomized delay of ${(delayMs / 1000).toFixed(1)} seconds...`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
     }
   }
 
