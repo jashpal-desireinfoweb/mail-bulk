@@ -615,7 +615,7 @@ apiRouter.post('/uploads/:id/send-batch', batchLimiter, catchAsync(async (req, r
     }
 
     // Add individual email sending delay to honor rate limits
-    await new Promise((r) => setTimeout(r, EMAIL_INDIVIDUAL_DELAY_MS));
+    await new Promise((r) => setTimeout(r, getRandomIndividualDelayMs()));
   }
 
   let sentCount = 0, failedCount = 0;

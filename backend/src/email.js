@@ -18,19 +18,26 @@ const isAzureConfigured =
 
 const azureEmailClient = isAzureConfigured ? new EmailClient(AZURE_COMMUNICATION_CONNECTION_STRING) : null;
 
-// Initialize NodeMailer SMTP Transporter with connection pooling
+// Initialize NodeMailer SMTP Transporter
+// Note: pool is set to false because 45s-70s delays cause Office 365 to close idle pooled TCP sockets, causing "Connection timeout"
 const smtpTransporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: SMTP_PORT,
-  secure: false,
-  pool: true,           // Reuse TCP connections across emails
-  maxConnections: 5,    // 5 concurrent SMTP connections
-  maxMessages: 100,     // Recycle connection after 100 messages
+  secure: SMTP_PORT === 465,
+  requireTLS: SMTP_PORT === 587,
+  pool: false,
+  connectionTimeout: 20000, // 20 seconds timeout for socket connection
+  greetingTimeout: 20000,   // 20 seconds timeout for SMTP greeting
+  socketTimeout: 30000,     // 30 seconds socket inactivity timeout
+  tls: {
+    rejectUnauthorized: false,
+  },
   auth: {
     user: SMTP_USER,
     pass: SMTP_PASS,
   },
 });
+
 
 async function sendViaAzure(options) {
   if (!azureEmailClient) {
