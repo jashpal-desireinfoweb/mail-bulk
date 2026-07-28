@@ -18,28 +18,26 @@ const isAzureConfigured =
 
 const azureEmailClient = isAzureConfigured ? new EmailClient(AZURE_COMMUNICATION_CONNECTION_STRING) : null;
 
-// Initialize NodeMailer SMTP Transporter
-// Note: family: 4 forces IPv4 DNS resolution to prevent Azure/Render IPv6 connection blackholes.
-// pool is set to false to avoid idle socket drops during delay intervals.
-const smtpTransporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: SMTP_PORT === 465,
-  requireTLS: SMTP_PORT === 587,
-  family: 4,               // Force IPv4 lookup to prevent Azure/Render IPv6 timeout issues
-  pool: false,
-  connectionTimeout: 30000, // 30 seconds timeout for socket connection
-  greetingTimeout: 30000,   // 30 seconds timeout for SMTP greeting
-  socketTimeout: 45000,     // 45 seconds socket inactivity timeout
-  tls: {
-    rejectUnauthorized: false,
-  },
-  auth: {
-    user: SMTP_USER,
-    pass: SMTP_PASS,
-  },
-});
-
+function createDynamicTransporter(hostOverride) {
+  return nodemailer.createTransport({
+    host: hostOverride || SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    requireTLS: SMTP_PORT === 587,
+    family: 4,               // Force IPv4 lookup to prevent IPv6 socket blackholes
+    pool: false,             // Fresh connection per email for STARTTLS stability
+    connectionTimeout: 12000, // 12 seconds timeout for rapid failover
+    greetingTimeout: 12000,   // 12 seconds greeting timeout
+    socketTimeout: 30000,     // 30 seconds socket inactivity timeout
+    tls: {
+      rejectUnauthorized: false,
+    },
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+}
 
 async function sendViaAzure(options) {
   if (!azureEmailClient) {
@@ -64,14 +62,34 @@ async function sendViaAzure(options) {
 
 async function sendViaSMTP(options) {
   const fromAddress = SMTP_USER ? `${SMTP_FROM_NAME} <${SMTP_USER}>` : AZURE_COMMUNICATION_FROM_EMAIL;
-  const info = await smtpTransporter.sendMail({
-    from: fromAddress,
-    to: options.to,
-    subject: options.subject,
-    html: options.html,
-    text: options.text,
-  });
-  return info.messageId || 'unknown';
+  
+  try {
+    const primaryTransporter = createDynamicTransporter(SMTP_HOST);
+    const info = await primaryTransporter.sendMail({
+      from: fromAddress,
+      to: options.to,
+      subject: options.subject,
+      html: options.html,
+      text: options.text,
+    });
+    return info.messageId || 'unknown';
+  } catch (err) {
+    // If primary host timed out and using Office 365, attempt failover host
+    const isTimeout = err.message?.toLowerCase().includes('timeout') || err.code === 'ETIMEDOUT' || err.code === 'ESOCKET';
+    if (isTimeout && SMTP_HOST.includes('office365.com')) {
+      console.warn(`[SMTP Failover] Primary host ${SMTP_HOST} timed out for ${options.to}. Retrying via fallback host smtp-mail.outlook.com...`);
+      const fallbackTransporter = createDynamicTransporter('smtp-mail.outlook.com');
+      const info = await fallbackTransporter.sendMail({
+        from: fromAddress,
+        to: options.to,
+        subject: options.subject,
+        html: options.html,
+        text: options.text,
+      });
+      return info.messageId || 'unknown';
+    }
+    throw err;
+  }
 }
 
 async function sendEmail(options) {

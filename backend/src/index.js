@@ -23,6 +23,8 @@ function getRandomIndividualDelayMs() {
 }
 
 const app = express();
+app.set('trust proxy', 1); // Trust Render reverse proxy for express-rate-limit X-Forwarded-For
+
 
 
 // --- CORS Configuration ---
