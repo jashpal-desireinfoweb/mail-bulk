@@ -11,12 +11,19 @@ const { renderTemplate, invalidateTemplate } = require('./templates-service');
 
 require('dotenv').config();
 
-// --- Rate Limit Settings for Email Sending ---
-const EMAIL_BATCH_SIZE = parseInt(process.env.EMAIL_BATCH_SIZE || '5', 10);
-const EMAIL_BATCH_DELAY_MS = parseInt(process.env.EMAIL_BATCH_DELAY_MS || '15000', 10);
-const EMAIL_INDIVIDUAL_DELAY_MS = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MS || '10000', 10);
+// --- Rate Limit Settings for Email Sending (Human-like Random Delays) ---
+const EMAIL_BATCH_SIZE = parseInt(process.env.EMAIL_BATCH_SIZE || '1', 10);
+const EMAIL_BATCH_DELAY_MS = parseInt(process.env.EMAIL_BATCH_DELAY_MS || '0', 10);
+
+function getRandomIndividualDelayMs() {
+  const min = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MIN_MS || '120000', 10);
+  const max = parseInt(process.env.EMAIL_INDIVIDUAL_DELAY_MAX_MS || '150000', 10);
+  if (max <= min) return min;
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 
 const app = express();
+
 
 // --- CORS Configuration ---
 app.use(
@@ -1106,15 +1113,17 @@ async function runCampaignInBackground(uploadId, templateId) {
         },
       });
 
-      // Pause to avoid rate limits
+      // Pause to simulate human sending activity and avoid Outlook bot detection
       if (i < contacts.length - 1) {
-        const isEndOfBatch = (i + 1) % EMAIL_BATCH_SIZE === 0;
-        if (isEndOfBatch) {
-          console.log(`[Scheduler] Batch of ${EMAIL_BATCH_SIZE} completed. Waiting ${EMAIL_BATCH_DELAY_MS}ms batch delay + ${EMAIL_INDIVIDUAL_DELAY_MS}ms individual delay...`);
-          await new Promise((r) => setTimeout(r, EMAIL_INDIVIDUAL_DELAY_MS));
+        const randomDelayMs = getRandomIndividualDelayMs();
+        const isEndOfBatch = EMAIL_BATCH_SIZE > 0 && (i + 1) % EMAIL_BATCH_SIZE === 0;
+        if (isEndOfBatch && EMAIL_BATCH_DELAY_MS > 0) {
+          console.log(`[Scheduler] Batch of ${EMAIL_BATCH_SIZE} completed. Waiting ${EMAIL_BATCH_DELAY_MS}ms batch delay + ${(randomDelayMs / 1000).toFixed(1)}s random delay...`);
+          await new Promise((r) => setTimeout(r, randomDelayMs));
           await new Promise((r) => setTimeout(r, EMAIL_BATCH_DELAY_MS));
         } else {
-          await new Promise((r) => setTimeout(r, EMAIL_INDIVIDUAL_DELAY_MS));
+          console.log(`[Scheduler] Waiting human-like randomized delay of ${(randomDelayMs / 1000).toFixed(1)} seconds before next email...`);
+          await new Promise((r) => setTimeout(r, randomDelayMs));
         }
       }
     }
@@ -1331,9 +1340,9 @@ async function runSchedulerIncrementally() {
           },
         });
 
-        // Small delay if we have time
-        const delay = Math.min(EMAIL_INDIVIDUAL_DELAY_MS, 500);
-        if (delay > 0 && (Date.now() - startTime < TIME_LIMIT_MS)) {
+        // Small delay if we have time budget in serverless mode
+        const delay = 500;
+        if (Date.now() - startTime < TIME_LIMIT_MS) {
           await new Promise((r) => setTimeout(r, delay));
         }
       }
