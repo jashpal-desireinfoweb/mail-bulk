@@ -6,7 +6,7 @@ module.exports = async function (context, myTimer) {
   const timeStamp = new Date().toISOString();
   const vercelBackendUrl =
     process.env.VERCEL_BACKEND_URL ||
-    'https://desire-mail-backend.vercel.app/api/cron/check-scheduler';
+    'https://desire-mail-marketing-excel.vercel.app/api/cron/check-scheduler';
   const cronSecret = process.env.CRON_SECRET;
 
   const log = (...args) => context.log('[Azure Timer Scheduler]', ...args);
