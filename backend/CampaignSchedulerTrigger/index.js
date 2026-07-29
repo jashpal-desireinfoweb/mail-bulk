@@ -7,12 +7,18 @@ module.exports = async function (context, myTimer) {
   const vercelBackendUrl =
     process.env.VERCEL_BACKEND_URL ||
     'https://desire-mail-backend.vercel.app/api/cron/check-scheduler';
-  const cronSecret =
-    process.env.CRON_SECRET || 'desire-mail-cron-secret-2026-production';
+  const cronSecret = process.env.CRON_SECRET;
 
-  context.log(
-    `[Azure Timer Scheduler] Triggering Vercel Campaign Scheduler at ${timeStamp}...`
-  );
+  const log = (...args) => context.log('[Azure Timer Scheduler]', ...args);
+  const logError = (...args) =>
+    context.log('[Azure Timer Scheduler][Error]', ...args);
+
+  if (!cronSecret) {
+    logError('CRON_SECRET is not configured in Function App settings.');
+    return;
+  }
+
+  log(`Triggering Vercel Campaign Scheduler at ${timeStamp}...`);
 
   return new Promise((resolve) => {
     try {
@@ -38,42 +44,37 @@ module.exports = async function (context, myTimer) {
         });
 
         res.on('end', () => {
-          context.log(
-            `[Azure Timer Scheduler] Vercel response status: ${res.statusCode}`
-          );
+          log(`Vercel response status: ${res.statusCode}`);
           try {
             const json = JSON.parse(body);
-            context.log(
-              `[Azure Timer Scheduler] Execution result:`,
-              JSON.stringify(json)
-            );
+            log('Execution result:', JSON.stringify(json));
           } catch (e) {
-            context.log(`[Azure Timer Scheduler] Response body:`, body);
+            log('Response body:', body);
+          }
+
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            logError(
+              `Upstream returned non-2xx status ${res.statusCode}. Check Vercel logs and Function App env vars.`
+            );
           }
           resolve();
         });
       });
 
       req.on('error', (err) => {
-        context.log.error(
-          `[Azure Timer Scheduler] Network error calling Vercel: ${err.message}`
-        );
+        logError(`Network error calling Vercel: ${err.message}`);
         resolve();
       });
 
       req.on('timeout', () => {
-        context.log.error(
-          `[Azure Timer Scheduler] Request timed out calling Vercel URL: ${vercelBackendUrl}`
-        );
+        logError(`Request timed out calling Vercel URL: ${vercelBackendUrl}`);
         req.destroy();
         resolve();
       });
 
       req.end();
     } catch (err) {
-      context.log.error(
-        `[Azure Timer Scheduler] Unexpected error: ${err.message}`
-      );
+      logError(`Unexpected error: ${err.message}`);
       resolve();
     }
   });
