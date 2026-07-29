@@ -4,14 +4,26 @@ const { URL } = require('url');
 
 module.exports = async function (context, myTimer) {
   const timeStamp = new Date().toISOString();
-  const vercelBackendUrl =
-    process.env.VERCEL_BACKEND_URL ||
-    'https://desire-mail-marketing-excel.vercel.app/api/cron/check-scheduler';
+  const vercelBackendUrl = process.env.VERCEL_BACKEND_URL;
   const cronSecret = process.env.CRON_SECRET;
 
   const log = (...args) => context.log('[Azure Timer Scheduler]', ...args);
   const logError = (...args) =>
     context.log('[Azure Timer Scheduler][Error]', ...args);
+
+  if (!vercelBackendUrl) {
+    logError(
+      'VERCEL_BACKEND_URL is not configured in Function App settings. It must point to the backend cron endpoint, for example https://<backend-project>.vercel.app/api/cron/check-scheduler.'
+    );
+    return;
+  }
+
+  if (!vercelBackendUrl.includes('/api/cron/check-scheduler')) {
+    logError(
+      `VERCEL_BACKEND_URL is pointing to the wrong route: ${vercelBackendUrl}. It must include /api/cron/check-scheduler and should not point to the frontend home page.`
+    );
+    return;
+  }
 
   if (!cronSecret) {
     logError('CRON_SECRET is not configured in Function App settings.');
