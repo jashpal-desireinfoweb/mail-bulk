@@ -39,7 +39,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Editor and IDE configurations
-.vscode/
+
 .idea/
 *.suo
 *.ntvs*
