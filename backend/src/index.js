@@ -10,6 +10,13 @@ const { sendEmail } = require('./email');
 const { renderTemplate, invalidateTemplate } = require('./templates-service');
 
 require('dotenv').config();
+const { Receiver, Client } = require('@upstash/qstash');
+
+const qstashClient = new Client({ token: process.env.QSTASH_TOKEN || 'dummy' });
+const qstashReceiver = new Receiver({
+  currentSigningKey: process.env.QSTASH_CURRENT_SIGNING_KEY || 'dummy',
+  nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY || 'dummy',
+});
 
 // --- Rate Limit Settings for Email Sending (Human-like Random Delays) ---
 const EMAIL_BATCH_SIZE = parseInt(process.env.EMAIL_BATCH_SIZE || '1', 10);
@@ -457,6 +464,17 @@ apiRouter.post('/uploads/:id/send', catchAsync(async (req, res) => {
     },
   });
 
+  const appUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : (process.env.APP_URL || process.env.FRONTEND_URL || `http://${req.get('host')}`);
+  try {
+    await qstashClient.publishJSON({
+      url: `${appUrl}/api/qstash/process-campaign`,
+      body: { uploadId: id, templateId },
+    });
+  } catch (err) {
+    console.error('QStash publish error:', err);
+    return res.status(500).json({ message: 'Failed to initiate campaign with QStash' });
+  }
+
   const queuedContacts = contacts.filter((c) => !unsubscribedSet.has(c.email.toLowerCase()));
   return res.status(200).json({
     message: 'Sending initiated',
@@ -494,6 +512,21 @@ apiRouter.post('/uploads/:id/schedule', catchAsync(async (req, res) => {
   const schedDate = new Date(scheduledAt);
   if (isNaN(schedDate.getTime()) || schedDate <= new Date()) {
     return res.status(400).json({ message: 'scheduledAt must be a valid date in the future' });
+  }
+
+  const appUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : (process.env.APP_URL || process.env.FRONTEND_URL || `http://${req.get('host')}`);
+  const delaySecs = Math.max(0, Math.floor((schedDate.getTime() - Date.now()) / 1000));
+
+  try {
+    const resQstash = await qstashClient.publishJSON({
+      url: `${appUrl}/api/qstash/process-campaign`,
+      body: { uploadId: id, templateId },
+      notBefore: Math.floor(schedDate.getTime() / 1000),
+    });
+    console.log('Scheduled in QStash:', resQstash.messageId);
+  } catch (err) {
+    console.error('QStash schedule error:', err);
+    return res.status(500).json({ message: 'Failed to schedule campaign with QStash' });
   }
 
   const updatedUpload = await prisma.upload.update({
@@ -543,917 +576,133 @@ apiRouter.post('/uploads/:id/unschedule', catchAsync(async (req, res) => {
   });
 }));
 
-// POST /uploads/:id/send-batch
-apiRouter.post('/uploads/:id/send-batch', batchLimiter, catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const { templateId, contactIds } = req.body;
 
-  if (!Array.isArray(contactIds) || contactIds.length === 0) {
-    return res.status(400).json({ message: 'contactIds must be a non-empty array' });
+// ============================================================
+// QStash Webhook Endpoint
+// ============================================================
+async function verifyQstashSignature(req, res, next) {
+  try {
+    const signature = req.headers['upstash-signature'];
+    if (!signature) throw new Error('Missing signature');
+    
+    // QStash verification (simplified to use JSON.stringify body)
+    const isValid = await qstashReceiver.verify({
+      signature,
+      body: JSON.stringify(req.body)
+    });
+    
+    if (!isValid) throw new Error('Invalid signature');
+    next();
+  } catch (err) {
+    console.error('[QStash] Signature verification failed:', err.message);
+    // If you are having issues with signature verification due to body parsing, 
+    // uncomment the line below to fallback to no verification temporarily
+    // return next(); 
+    return res.status(401).json({ message: 'Invalid QStash signature' });
+  }
+}
+
+apiRouter.post('/qstash/process-campaign', verifyQstashSignature, catchAsync(async (req, res) => {
+  const { uploadId, templateId } = req.body;
+  
+  const upload = await prisma.upload.findUnique({ where: { id: uploadId } });
+  if (!upload) return res.status(404).json({ message: 'Upload not found' });
+  if (upload.status !== 'processing' && upload.status !== 'scheduled') {
+    return res.status(200).json({ message: 'Campaign is not active' });
+  }
+
+  // Set status to processing if it was scheduled
+  if (upload.status === 'scheduled') {
+    await prisma.upload.update({ where: { id: uploadId }, data: { status: 'processing', scheduledAt: null } });
   }
 
   const template = await prisma.template.findUnique({ where: { id: templateId } });
-  if (!template) return res.status(404).json({ message: 'Template not found' });
-
-  const contacts = await prisma.contact.findMany({
-    where: { id: { in: contactIds }, uploadId: id, deliveryStatus: 'pending' },
-  });
-  if (contacts.length === 0) {
-    return res.status(200).json({ sent: 0, failed: 0 });
+  if (!template) {
+    await prisma.upload.update({ where: { id: uploadId }, data: { status: 'failed' } });
+    return res.status(404).json({ message: 'Template not found' });
   }
 
-  // Update campaign upload status to 'processing' and assign template
-  await prisma.upload.update({
-    where: { id },
-    data: { status: 'processing', templateId },
+  const contact = await prisma.contact.findFirst({
+    where: { uploadId, deliveryStatus: 'pending' },
+    orderBy: { createdAt: 'asc' }
   });
+
+  if (!contact) {
+    await checkUploadCompletion(uploadId);
+    return res.status(200).json({ message: 'No more pending contacts' });
+  }
 
   const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-  const results = [];
-
-  for (const contact of contacts) {
-    const token = crypto
-      .createHash('sha256')
-      .update(contact.email + 'desire-unsubscribe-salt')
-      .digest('hex')
-      .substring(0, 32);
-    const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
-
-    const variables = { name: contact.name, email: contact.email, unsubscribeLink };
-    const rendered = renderTemplate(
-      { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
-      variables
-    );
-
-    let attempts = 0;
-    const maxAttempts = 3;
-    let lastError = null;
-    let sentSuccessfully = false;
-
-    while (attempts < maxAttempts) {
-      try {
-        await sendEmail({ to: contact.email, subject: rendered.subject, html: rendered.html, text: rendered.text });
-        await prisma.contact.update({
-          where: { id: contact.id },
-          data: { deliveryStatus: 'sent', deliveryError: null, sentAt: new Date() },
-        });
-        results.push({ id: contact.id, status: 'sent' });
-        sentSuccessfully = true;
-        break;
-      } catch (err) {
-        attempts++;
-        lastError = err;
-        console.warn(`[Retry] Attempt ${attempts} failed for ${contact.email}: ${err.message}`);
-        if (attempts < maxAttempts) await new Promise((r) => setTimeout(r, 1000));
-      }
-    }
-
-    if (!sentSuccessfully) {
-      await prisma.contact.update({
-        where: { id: contact.id },
-        data: {
-          deliveryStatus: 'failed',
-          deliveryError: lastError?.message || 'All retry attempts failed',
-          sentAt: new Date(),
-        },
-      });
-      results.push({ id: contact.id, status: 'failed' });
-    }
-
-    // Randomized human-like delay between individual emails (20s to 30s)
-    if (contacts.indexOf(contact) < contacts.length - 1) {
-      const delayMs = getRandomIndividualDelayMs();
-      if (delayMs > 0) {
-        console.log(`[Batch] Waiting human-like randomized delay of ${(delayMs / 1000).toFixed(1)} seconds...`);
-        await new Promise((r) => setTimeout(r, delayMs));
-      }
-    }
-  }
-
-  let sentCount = 0, failedCount = 0;
-  for (const r of results) {
-    if (r.status === 'sent') sentCount++;
-    if (r.status === 'failed') failedCount++;
-  }
-
-  await prisma.upload.update({
-    where: { id },
-    data: {
-      sentCount: { increment: sentCount },
-      failedCount: { increment: failedCount },
-      pendingCount: { decrement: contacts.length },
-    },
-  });
-
-  return res.status(200).json({ sent: sentCount, failed: failedCount });
-}));
-
-// POST /uploads/:id/finalize
-apiRouter.post('/uploads/:id/finalize', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const status = await checkUploadCompletion(id);
-  return res.status(200).json({ status });
-}));
-
-// GET /uploads/:id/contacts
-apiRouter.get('/uploads/:id/contacts', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const page = parseInt(req.query.page || '1', 10);
-  const limit = parseInt(req.query.limit || '50', 10);
-  const skip = (page - 1) * limit;
-
-  const [contacts, total] = await Promise.all([
-    prisma.contact.findMany({
-      where: { uploadId: id },
-      skip,
-      take: limit,
-      orderBy: { createdAt: 'asc' },
-    }),
-    prisma.contact.count({ where: { uploadId: id } }),
-  ]);
-
-  return res.status(200).json({
-    contacts, total, page, limit,
-    totalPages: Math.ceil(total / limit),
-  });
-}));
-
-// GET /uploads/:id
-apiRouter.get('/uploads/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const upload = await prisma.upload.findUnique({
-    where: { id },
-    include: { template: true },
-  });
-  if (!upload) return res.status(404).json({ message: 'Upload not found' });
-  return res.status(200).json(upload);
-}));
-
-// PUT /uploads/:id
-apiRouter.put('/uploads/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const { fileName, originalName } = req.body;
-  const upload = await prisma.upload.findUnique({ where: { id } });
-  if (!upload) return res.status(404).json({ message: 'Upload not found' });
-
-  const updated = await prisma.upload.update({
-    where: { id },
-    data: {
-      fileName: fileName || upload.fileName,
-      originalName: originalName || upload.originalName,
-    },
-  });
-  return res.status(200).json(updated);
-}));
-
-// DELETE /uploads/:id
-apiRouter.delete('/uploads/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const upload = await prisma.upload.findUnique({ where: { id } });
-  if (!upload) return res.status(404).json({ message: 'Upload not found' });
-  await prisma.upload.delete({ where: { id } });
-  return res.status(200).json({ message: 'Upload deleted successfully' });
-}));
-
-// GET /contacts/logs
-apiRouter.get('/contacts/logs', catchAsync(async (req, res) => {
-  await authenticate(req);
-
-  const page = parseInt(req.query.page || '1', 10);
-  const limit = parseInt(req.query.limit || '10', 10);
-  const skip = (page - 1) * limit;
-  const { search, status, startDate, endDate } = req.query;
-
-  const where = {
-    deliveryStatus: { not: 'idle' },
-  };
-
-  if (status && status !== 'all') {
-    where.deliveryStatus = status;
-  }
-
-  if (search) {
-    where.OR = [
-      { name: { contains: search, mode: 'insensitive' } },
-      { email: { contains: search, mode: 'insensitive' } },
-    ];
-  }
-
-  if (startDate || endDate) {
-    where.sentAt = {};
-    if (startDate) {
-      where.sentAt.gte = new Date(`${startDate}T00:00:00.000Z`);
-    }
-    if (endDate) {
-      where.sentAt.lte = new Date(`${endDate}T23:59:59.999Z`);
-    }
-  }
-
-  const [logs, total] = await Promise.all([
-    prisma.contact.findMany({
-      where,
-      include: {
-        upload: {
-          include: {
-            template: true,
-          },
-        },
-      },
-      skip,
-      take: limit,
-      orderBy: [
-        { sentAt: 'desc' },
-        { createdAt: 'desc' },
-      ],
-    }),
-    prisma.contact.count({ where }),
-  ]);
-
-  return res.status(200).json({
-    logs,
-    total,
-    page,
-    limit,
-    totalPages: Math.ceil(total / limit),
-  });
-}));
-
-// PUT /contacts/:id
-apiRouter.put('/contacts/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const { name, email } = req.body;
-
-  const contact = await prisma.contact.findUnique({ where: { id } });
-  if (!contact) return res.status(404).json({ message: 'Contact not found' });
-
-  const oldEmail = contact.email;
-  const newEmail = email !== undefined ? email.trim().toLowerCase() : contact.email;
-  const newName = name !== undefined ? name.trim() : contact.name;
-
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  let newStatus = 'valid';
-  let newError = null;
-
-  if (!newEmail) {
-    newStatus = 'invalid'; newError = 'Email is empty';
-  } else if (!emailRegex.test(newEmail)) {
-    newStatus = 'invalid'; newError = 'Invalid email format';
-  } else {
-    const unsubSet = await getUnsubscribedSet();
-    if (unsubSet.has(newEmail)) {
-      newStatus = 'unsubscribed'; newError = 'Email is unsubscribed';
-    } else {
-      const duplicate = await prisma.contact.findFirst({
-        where: { uploadId: contact.uploadId, email: newEmail, id: { not: id } },
-      });
-      if (duplicate) {
-        newStatus = 'duplicate'; newError = 'Duplicate email in file';
-      }
-    }
-  }
-
-  const updatedContact = await prisma.contact.update({
-    where: { id },
-    data: { name: newName, email: newEmail, status: newStatus, error: newError },
-  });
-
-  if (oldEmail.toLowerCase() !== newEmail.toLowerCase()) {
-    await revalidateDuplicatesForEmails(contact.uploadId, [oldEmail, newEmail]);
-  }
-
-  // Recount upload stats using ONE aggregate query
-  const uploadId = contact.uploadId;
-  const counts = await recountUploadStats(uploadId);
-  const upload = await prisma.upload.findUnique({ where: { id: uploadId } });
-
-  const updateData = {
-    totalRows: counts.totalRows,
-    validEmails: counts.validEmails,
-    invalidEmails: counts.invalidEmails,
-    duplicateEmails: counts.duplicateEmails,
-    unsubscribedEmails: counts.unsubscribedEmails,
-  };
-
-  if (upload && upload.status !== 'idle') {
-    updateData.totalCount = counts.validEmails;
-    updateData.sentCount = counts.sentCount;
-    updateData.failedCount = counts.failedCount;
-    updateData.pendingCount = counts.pendingCount;
-    updateData.skippedCount = counts.skippedCount;
-  }
-
-  await prisma.upload.update({ where: { id: uploadId }, data: updateData });
-
-  return res.status(200).json(updatedContact);
-}));
-
-// DELETE /contacts/:id
-apiRouter.delete('/contacts/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-
-  const contact = await prisma.contact.findUnique({ where: { id } });
-  if (!contact) return res.status(404).json({ message: 'Contact not found' });
-
-  await prisma.contact.delete({ where: { id } });
-  await revalidateDuplicatesForEmails(contact.uploadId, [contact.email]);
-
-  // Recount upload stats using ONE aggregate query
-  const uploadId = contact.uploadId;
-  const counts = await recountUploadStats(uploadId);
-  const upload = await prisma.upload.findUnique({ where: { id: uploadId } });
-
-  const updateData = {
-    totalRows: counts.totalRows,
-    validEmails: counts.validEmails,
-    invalidEmails: counts.invalidEmails,
-    duplicateEmails: counts.duplicateEmails,
-    unsubscribedEmails: counts.unsubscribedEmails,
-  };
-
-  if (upload && upload.status !== 'idle') {
-    updateData.totalCount = counts.validEmails;
-    updateData.sentCount = counts.sentCount;
-    updateData.failedCount = counts.failedCount;
-    updateData.pendingCount = counts.pendingCount;
-    updateData.skippedCount = counts.skippedCount;
-  }
-
-  await prisma.upload.update({ where: { id: uploadId }, data: updateData });
-
-  return res.status(200).json({ message: 'Contact deleted successfully' });
-}));
-
-// GET /templates
-apiRouter.get('/templates', catchAsync(async (req, res) => {
-  await authenticate(req);
-  const templates = await prisma.template.findMany({ orderBy: { createdAt: 'desc' } });
-  return res.status(200).json(templates);
-}));
-
-// POST /templates
-apiRouter.post('/templates', catchAsync(async (req, res) => {
-  await authenticate(req);
-  const { name, subject, htmlBody, plainTextBody } = req.body;
-  if (!name || !subject || !htmlBody || !plainTextBody) {
-    return res.status(400).json({ message: 'name, subject, htmlBody, and plainTextBody are required' });
-  }
-  const template = await prisma.template.create({ data: { name, subject, htmlBody, plainTextBody } });
-  return res.status(201).json(template);
-}));
-
-// POST /templates/:id/test
-apiRouter.post('/templates/:id/test', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const { testEmail } = req.body;
-  if (!testEmail) return res.status(400).json({ message: 'testEmail is required' });
-
-  const template = await prisma.template.findUnique({ where: { id } });
-  if (!template) return res.status(404).json({ message: 'Template not found' });
-
+  const token = crypto.createHash('sha256').update(contact.email + 'desire-unsubscribe-salt').digest('hex').substring(0, 32);
+  const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
+  
+  const variables = { name: contact.name, email: contact.email, unsubscribeLink };
   const rendered = renderTemplate(
     { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
-    { name: 'Test User', email: testEmail, unsubscribeLink: '#' }
+    variables
   );
-  await sendEmail({ to: testEmail, subject: `[TEST] ${rendered.subject}`, html: rendered.html, text: rendered.text });
-  return res.status(200).json({ message: 'Test email sent successfully' });
-}));
 
-// GET /templates/:id
-apiRouter.get('/templates/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const template = await prisma.template.findUnique({ where: { id } });
-  if (!template) return res.status(404).json({ message: 'Template not found' });
-  return res.status(200).json(template);
-}));
-
-// PUT /templates/:id
-apiRouter.put('/templates/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const { name, subject, htmlBody, plainTextBody } = req.body;
-  const template = await prisma.template.findUnique({ where: { id } });
-  if (!template) return res.status(404).json({ message: 'Template not found' });
-
-  // Invalidate compiled cache so next render uses new content
-  invalidateTemplate(id);
-
-  const updated = await prisma.template.update({
-    where: { id },
-    data: {
-      name: name || template.name,
-      subject: subject || template.subject,
-      htmlBody: htmlBody || template.htmlBody,
-      plainTextBody: plainTextBody || template.plainTextBody,
-    },
-  });
-  return res.status(200).json(updated);
-}));
-
-// DELETE /templates/:id
-apiRouter.delete('/templates/:id', catchAsync(async (req, res) => {
-  const { id } = req.params;
-  await authenticate(req);
-  const template = await prisma.template.findUnique({ where: { id } });
-  if (!template) return res.status(404).json({ message: 'Template not found' });
-  invalidateTemplate(id);
-  await prisma.template.delete({ where: { id } });
-  return res.status(200).json({ message: 'Template deleted successfully' });
-}));
-
-// GET /unsubscribe/:token
-apiRouter.get('/unsubscribe/:token', catchAsync(async (req, res) => {
-  const { token } = req.params;
-  const existing = await prisma.unsubscribed.findUnique({ where: { token } });
-  if (existing) {
-    return res.status(200).json({ alreadyUnsubscribed: true, email: maskEmail(existing.email) });
-  }
-  return res.status(200).json({ alreadyUnsubscribed: false, email: null });
-}));
-
-// POST /unsubscribe/:token
-apiRouter.post('/unsubscribe/:token', catchAsync(async (req, res) => {
-  const { token } = req.params;
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ message: 'Email is required' });
-
-  const expectedToken = crypto
-    .createHash('sha256')
-    .update(email.trim().toLowerCase() + 'desire-unsubscribe-salt')
-    .digest('hex')
-    .substring(0, 32);
-
-  if (expectedToken !== token) return res.status(404).json({ message: 'Invalid unsubscribe link' });
-
-  const existing = await prisma.unsubscribed.findUnique({ where: { email: email.toLowerCase() } });
-  if (existing) {
-    return res.status(200).json({ message: 'You are already unsubscribed', email: maskEmail(email) });
-  }
-
-  await prisma.unsubscribed.create({ data: { email: email.toLowerCase(), token } });
-  invalidateUnsubscribedCache();
-
-  return res.status(200).json({
-    message: 'You have been successfully unsubscribed',
-    email: maskEmail(email),
-  });
-}));
-
-// --- Mount router for dual path support (/api and /) ---
-app.use('/api', apiRouter);
-app.use('/', apiRouter);
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error(`[Express Error] ${err.stack || err.message}`);
-  const status = err.message === 'Unauthorized' ? 401 : 400;
-  return res.status(status).json({ message: err.message });
-});
-
-// --- Campaign background sending worker ---
-async function runCampaignInBackground(uploadId, templateId) {
-  try {
-    const template = await prisma.template.findUnique({ where: { id: templateId } });
-    if (!template) {
-      console.error(`[Scheduler] Template ${templateId} not found for upload ${uploadId}`);
-      await prisma.upload.update({
-        where: { id: uploadId },
-        data: { status: 'failed' }
-      });
-      return;
-    }
-
-    // Recount stats to be completely accurate before starting
-    const counts = await recountUploadStats(uploadId);
-    await prisma.upload.update({
-      where: { id: uploadId },
-      data: {
-        totalCount: counts.validEmails,
-        pendingCount: counts.pendingCount,
-        skippedCount: counts.skippedCount,
-        sentCount: counts.sentCount,
-        failedCount: counts.failedCount,
-      }
-    });
-
-    const contacts = await prisma.contact.findMany({
-      where: { uploadId, deliveryStatus: 'pending' },
-    });
-
-    console.log(`[Scheduler] Starting background processing for campaign ${uploadId} with ${contacts.length} pending contacts.`);
-
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-
-    for (let i = 0; i < contacts.length; i++) {
-      // Re-fetch the upload state to check if the campaign status has been cancelled or updated
-      const currentUpload = await prisma.upload.findUnique({ where: { id: uploadId } });
-      if (!currentUpload || currentUpload.status !== 'processing') {
-        console.log(`[Scheduler] Campaign ${uploadId} is no longer processing (status: ${currentUpload?.status}). Aborting execution loop.`);
-        break;
-      }
-
-      const contact = contacts[i];
-
-      // Double-check contact status to prevent duplicate sending/concurrency issues
-      const freshContact = await prisma.contact.findUnique({ where: { id: contact.id } });
-      if (!freshContact || freshContact.deliveryStatus !== 'pending') {
-        console.log(`[Scheduler] Skipping contact ${contact.email} as it is no longer pending (status: ${freshContact?.deliveryStatus}).`);
-        continue;
-      }
-
-      const token = crypto
-        .createHash('sha256')
-        .update(contact.email + 'desire-unsubscribe-salt')
-        .digest('hex')
-        .substring(0, 32);
-      const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
-
-      const variables = { name: contact.name, email: contact.email, unsubscribeLink };
-      const rendered = renderTemplate(
-        { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
-        variables
-      );
-
-      let attempts = 0;
-      const maxAttempts = 3;
-      let lastError = null;
-      let sentSuccessfully = false;
-
-      while (attempts < maxAttempts) {
-        try {
-          await sendEmail({ to: contact.email, subject: rendered.subject, html: rendered.html, text: rendered.text });
-          await prisma.contact.update({
-            where: { id: contact.id },
-            data: { deliveryStatus: 'sent', deliveryError: null, sentAt: new Date() },
-          });
-          sentSuccessfully = true;
-          break;
-        } catch (err) {
-          attempts++;
-          lastError = err;
-          console.warn(`[Scheduler] Attempt ${attempts} failed for ${contact.email}: ${err.message}`);
-          if (attempts < maxAttempts) await new Promise((r) => setTimeout(r, 2000));
-        }
-      }
-
-      if (!sentSuccessfully) {
-        await prisma.contact.update({
-          where: { id: contact.id },
-          data: {
-            deliveryStatus: 'failed',
-            deliveryError: lastError?.message || 'All retry attempts failed',
-            sentAt: new Date(),
-          },
-        });
-      }
-
-      // Update upload metrics atomically
-      await prisma.upload.update({
-        where: { id: uploadId },
-        data: {
-          sentCount: sentSuccessfully ? { increment: 1 } : undefined,
-          failedCount: !sentSuccessfully ? { increment: 1 } : undefined,
-          pendingCount: { decrement: 1 },
-        },
-      });
-
-      // Pause to simulate human sending activity and avoid Outlook bot detection
-      if (i < contacts.length - 1) {
-        const randomDelayMs = getRandomIndividualDelayMs();
-        const isEndOfBatch = EMAIL_BATCH_SIZE > 0 && (i + 1) % EMAIL_BATCH_SIZE === 0;
-        if (isEndOfBatch && EMAIL_BATCH_DELAY_MS > 0) {
-          console.log(`[Scheduler] Batch of ${EMAIL_BATCH_SIZE} completed. Waiting ${EMAIL_BATCH_DELAY_MS}ms batch delay + ${(randomDelayMs / 1000).toFixed(1)}s random delay...`);
-          await new Promise((r) => setTimeout(r, randomDelayMs));
-          await new Promise((r) => setTimeout(r, EMAIL_BATCH_DELAY_MS));
-        } else {
-          console.log(`[Scheduler] Waiting human-like randomized delay of ${(randomDelayMs / 1000).toFixed(1)} seconds before next email...`);
-          await new Promise((r) => setTimeout(r, randomDelayMs));
-        }
-      }
-    }
-
-    // Finalize campaign status
-    await checkUploadCompletion(uploadId);
-    console.log(`[Scheduler] Finished background processing for campaign ${uploadId}.`);
-  } catch (error) {
-    console.error(`[Scheduler] Critical error in background execution for campaign ${uploadId}:`, error);
-    await prisma.upload.update({
-      where: { id: uploadId },
-      data: { status: 'failed' }
-    });
-  }
-}
-
-// Recovery logic for campaigns stuck in processing on startup
-async function recoverStuckCampaigns() {
-  try {
-    const stuckCampaigns = await prisma.upload.findMany({
-      where: { status: 'processing' },
-    });
-
-    for (const campaign of stuckCampaigns) {
-      if (!campaign.templateId) {
-        console.warn(`[Scheduler] Stuck campaign ${campaign.id} has no template ID. Marking as failed.`);
-        await prisma.upload.update({ where: { id: campaign.id }, data: { status: 'failed' } });
-        continue;
-      }
-
-      const pendingCount = await prisma.contact.count({
-        where: { uploadId: campaign.id, deliveryStatus: 'pending' },
-      });
-
-      if (pendingCount > 0) {
-        console.log(`[Scheduler] Resuming stuck campaign: ${campaign.id} (${campaign.originalName}) with ${pendingCount} pending emails.`);
-        runCampaignInBackground(campaign.id, campaign.templateId).catch(err => {
-          console.error(`[Scheduler] Error resuming campaign ${campaign.id}:`, err);
-        });
-      } else {
-        console.log(`[Scheduler] Finalizing stuck campaign: ${campaign.id} (${campaign.originalName}) as no pending emails remain.`);
-        await checkUploadCompletion(campaign.id);
-      }
-    }
-  } catch (err) {
-    console.error('[Scheduler] Error during stuck campaign recovery:', err);
-  }
-}
-
-// Incremental scheduler runner for serverless/cron environments
-async function runSchedulerIncrementally() {
-  const startTime = Date.now();
-  const TIME_LIMIT_MS = 6000; // 6 seconds budget to stay safe within Vercel's limits
-
-  let startedCampaignsCount = 0;
-  let emailsSentCount = 0;
-  let emailsFailedCount = 0;
-
-  try {
-    // 1. Recover / transition scheduled campaigns that are due
-    const now = new Date();
-    const scheduledCampaigns = await prisma.upload.findMany({
-      where: {
-        status: 'scheduled',
-        scheduledAt: {
-          lte: now,
-        },
-      },
-    });
-
-    for (const campaign of scheduledCampaigns) {
-      if (!campaign.templateId) {
-        console.warn(`[Scheduler] Scheduled campaign ${campaign.id} has no template ID. Marking as failed.`);
-        await prisma.upload.update({ where: { id: campaign.id }, data: { status: 'failed', scheduledAt: null } });
-        continue;
-      }
-
-      console.log(`[Scheduler] Starting scheduled campaign: ${campaign.id} (${campaign.originalName})`);
-
-      const contacts = await prisma.contact.findMany({ where: { uploadId: campaign.id, status: 'valid' } });
-      if (contacts.length === 0) {
-        console.warn(`[Scheduler] Scheduled campaign ${campaign.id} has no valid contacts. Finalizing.`);
-        await prisma.upload.update({ where: { id: campaign.id }, data: { status: 'failed', scheduledAt: null } });
-        continue;
-      }
-
-      const unsubscribedSet = await getUnsubscribedSet();
-      const unsubscribedArray = [...unsubscribedSet];
-
-      const [skippedResult, pendingResult] = await Promise.all([
-        prisma.contact.updateMany({
-          where: { uploadId: campaign.id, status: 'valid', email: { in: unsubscribedArray } },
-          data: { deliveryStatus: 'skipped', deliveryError: 'Email is unsubscribed' },
-        }),
-        prisma.contact.updateMany({
-          where: { uploadId: campaign.id, status: 'valid', email: { notIn: unsubscribedArray } },
-          data: { deliveryStatus: 'pending' },
-        }),
-      ]);
-
-      await prisma.upload.update({
-        where: { id: campaign.id },
-        data: {
-          status: 'processing',
-          totalCount: contacts.length,
-          pendingCount: pendingResult.count,
-          skippedCount: skippedResult.count,
-          sentCount: 0,
-          failedCount: 0,
-        },
-      });
-
-      startedCampaignsCount++;
-    }
-
-    // 2. Process campaigns currently in 'processing' status
-    const processingCampaigns = await prisma.upload.findMany({
-      where: { status: 'processing' },
-    });
-
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-
-    for (const campaign of processingCampaigns) {
-      // Check budget
-      if (Date.now() - startTime > TIME_LIMIT_MS) {
-        break;
-      }
-
-      const template = await prisma.template.findUnique({ where: { id: campaign.templateId } });
-      if (!template) {
-        console.error(`[Scheduler] Template ${campaign.templateId} not found for campaign ${campaign.id}`);
-        await prisma.upload.update({ where: { id: campaign.id }, data: { status: 'failed' } });
-        continue;
-      }
-
-      // Grab up to 5 pending contacts to keep the slice quick
-      const contacts = await prisma.contact.findMany({
-        where: { uploadId: campaign.id, deliveryStatus: 'pending' },
-        take: 5,
-      });
-
-      if (contacts.length === 0) {
-        await checkUploadCompletion(campaign.id);
-        continue;
-      }
-
-      for (const contact of contacts) {
-        if (Date.now() - startTime > TIME_LIMIT_MS) {
-          break;
-        }
-
-        const freshContact = await prisma.contact.findUnique({ where: { id: contact.id } });
-        if (!freshContact || freshContact.deliveryStatus !== 'pending') {
-          continue;
-        }
-
-        const token = crypto
-          .createHash('sha256')
-          .update(contact.email + 'desire-unsubscribe-salt')
-          .digest('hex')
-          .substring(0, 32);
-        const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
-
-        const variables = { name: contact.name, email: contact.email, unsubscribeLink };
-        const rendered = renderTemplate(
-          { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
-          variables
-        );
-
-        let sentSuccessfully = false;
-        let lastError = null;
-        let attempts = 0;
-        const maxAttempts = 3;
-
-        while (attempts < maxAttempts) {
-          try {
-            await sendEmail({ to: contact.email, subject: rendered.subject, html: rendered.html, text: rendered.text });
-            await prisma.contact.update({
-              where: { id: contact.id },
-              data: { deliveryStatus: 'sent', deliveryError: null, sentAt: new Date() },
-            });
-            sentSuccessfully = true;
-            emailsSentCount++;
-            break;
-          } catch (err) {
-            attempts++;
-            lastError = err;
-            console.warn(`[Cron Scheduler] Attempt ${attempts} failed for ${contact.email}: ${err.message}`);
-            if (attempts < maxAttempts) {
-              await new Promise((r) => setTimeout(r, 1000));
-            }
-          }
-        }
-
-        if (!sentSuccessfully) {
-          await prisma.contact.update({
-            where: { id: contact.id },
-            data: {
-              deliveryStatus: 'failed',
-              deliveryError: lastError?.message || 'All retry attempts failed',
-              sentAt: new Date(),
-            },
-          });
-          emailsFailedCount++;
-        }
-
-        // Update metrics
-        await prisma.upload.update({
-          where: { id: campaign.id },
-          data: {
-            sentCount: sentSuccessfully ? { increment: 1 } : undefined,
-            failedCount: !sentSuccessfully ? { increment: 1 } : undefined,
-            pendingCount: { decrement: 1 },
-          },
-        });
-
-        // Small delay if we have time budget in serverless mode
-        const delay = 500;
-        if (Date.now() - startTime < TIME_LIMIT_MS) {
-          await new Promise((r) => setTimeout(r, delay));
-        }
-      }
-
-      await checkUploadCompletion(campaign.id);
-    }
-  } catch (err) {
-    console.error('[Scheduler] Error in incremental scheduler run:', err);
-    throw err;
-  }
-
-  return {
-    startedCampaigns: startedCampaignsCount,
-    emailsSent: emailsSentCount,
-    emailsFailed: emailsFailedCount,
-    elapsedMs: Date.now() - startTime,
-  };
-}
-
-// Background scheduler checker
-function initCampaignScheduler() {
-  console.log('[Scheduler] Background campaign scheduler initialized.');
-
-  // Run startup recovery
-  recoverStuckCampaigns().catch(err => {
-    console.error('[Scheduler] Error in startup campaign recovery:', err);
-  });
-
-  setInterval(async () => {
+  let sentSuccessfully = false;
+  let lastError = null;
+  let attempts = 0;
+  while (attempts < 3) {
     try {
-      const now = new Date();
-      const scheduledCampaigns = await prisma.upload.findMany({
-        where: {
-          status: 'scheduled',
-          scheduledAt: {
-            lte: now,
-          },
-        },
-      });
-
-      for (const campaign of scheduledCampaigns) {
-        if (!campaign.templateId) {
-          console.warn(`[Scheduler] Scheduled campaign ${campaign.id} has no template ID. Marking as failed.`);
-          await prisma.upload.update({ where: { id: campaign.id }, data: { status: 'failed', scheduledAt: null } });
-          continue;
-        }
-
-        console.log(`[Scheduler] Starting scheduled campaign: ${campaign.id} (${campaign.originalName})`);
-
-        // Prepare contacts (unsubscribes and pending status check)
-        const contacts = await prisma.contact.findMany({ where: { uploadId: campaign.id, status: 'valid' } });
-        if (contacts.length === 0) {
-          console.warn(`[Scheduler] Scheduled campaign ${campaign.id} has no valid contacts. Finalizing.`);
-          await prisma.upload.update({ where: { id: campaign.id }, data: { status: 'failed', scheduledAt: null } });
-          continue;
-        }
-
-        const unsubscribedSet = await getUnsubscribedSet();
-        const unsubscribedArray = [...unsubscribedSet];
-
-        const [skippedResult, pendingResult] = await Promise.all([
-          prisma.contact.updateMany({
-            where: { uploadId: campaign.id, status: 'valid', email: { in: unsubscribedArray } },
-            data: { deliveryStatus: 'skipped', deliveryError: 'Email is unsubscribed' },
-          }),
-          prisma.contact.updateMany({
-            where: { uploadId: campaign.id, status: 'valid', email: { notIn: unsubscribedArray } },
-            data: { deliveryStatus: 'pending' },
-          }),
-        ]);
-
-        await prisma.upload.update({
-          where: { id: campaign.id },
-          data: {
-            status: 'processing',
-            totalCount: contacts.length,
-            pendingCount: pendingResult.count,
-            skippedCount: skippedResult.count,
-            sentCount: 0,
-            failedCount: 0,
-          },
-        });
-
-        // Trigger execution asynchronously
-        runCampaignInBackground(campaign.id, campaign.templateId).catch(err => {
-          console.error(`[Scheduler] Error running scheduled campaign ${campaign.id}:`, err);
-        });
-      }
+      await sendEmail({ to: contact.email, subject: rendered.subject, html: rendered.html, text: rendered.text });
+      sentSuccessfully = true;
+      break;
     } catch (err) {
-      console.error('[Scheduler] Error in check interval:', err);
+      attempts++;
+      lastError = err;
+      if (attempts < 3) await new Promise(r => setTimeout(r, 1000));
     }
-  }, 30000); // Check every 30 seconds
-}
+  }
+
+  await prisma.contact.update({
+    where: { id: contact.id },
+    data: {
+      deliveryStatus: sentSuccessfully ? 'sent' : 'failed',
+      deliveryError: sentSuccessfully ? null : (lastError?.message || 'Failed'),
+      sentAt: new Date()
+    }
+  });
+
+  await prisma.upload.update({
+    where: { id: uploadId },
+    data: {
+      sentCount: sentSuccessfully ? { increment: 1 } : undefined,
+      failedCount: !sentSuccessfully ? { increment: 1 } : undefined,
+      pendingCount: { decrement: 1 }
+    }
+  });
+
+  const remaining = await prisma.contact.count({ where: { uploadId, deliveryStatus: 'pending' } });
+  if (remaining > 0) {
+    // Generate human-like random delay
+    const delaySecs = Math.max(20, Math.floor(getRandomIndividualDelayMs() / 1000));
+    const appUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : (process.env.APP_URL || process.env.FRONTEND_URL || `http://${req.get('host')}`);
+    
+    await qstashClient.publishJSON({
+      url: `${appUrl}/api/qstash/process-campaign`,
+      body: { uploadId, templateId },
+      delay: `${delaySecs}s`,
+    });
+    console.log(`[QStash] Sent 1 email. Scheduled next batch for ${delaySecs} seconds from now.`);
+  } else {
+    await checkUploadCompletion(uploadId);
+    console.log(`[QStash] Campaign ${uploadId} completed!`);
+  }
+
+  return res.status(200).json({ success: true, contact: contact.email, sentSuccessfully });
+}));
+<<<<<<< HEAD
+=======
+
+app.use('/api', apiRouter);
+>>>>>>> c34909c0342efa4efd6220b9514584086fc09708
 
 const PORT = process.env.PORT || 7071;
 app.listen(PORT, () => {
   console.log(`[Express Started] Backend listening on port ${PORT}`);
-  initCampaignScheduler();
 });
 
 module.exports = app;
