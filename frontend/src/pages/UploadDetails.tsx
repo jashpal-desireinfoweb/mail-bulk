@@ -39,8 +39,7 @@ export default function UploadDetails() {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState('');
   const [sending, setSending] = useState(false);
-  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; active: boolean } | null>(null);
-  const [nextBatchCountdown, setNextBatchCountdown] = useState<number | null>(null);
+
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
   const [iframeHeight, setIframeHeight] = useState('400px');
@@ -375,70 +374,23 @@ export default function UploadDetails() {
     setSending(true);
     try {
       const response = await uploadApi.startSend(id, selectedTemplateId);
-      const { queuedContacts, batchSize = 5, batchDelayMs = 15000 } = response.data;
+      const { queuedContacts } = response.data;
 
       setIsSendModalOpen(false);
 
       if (queuedContacts && queuedContacts.length > 0) {
-        const batches = [];
-        for (let i = 0; i < queuedContacts.length; i += batchSize) {
-          batches.push(queuedContacts.slice(i, i + batchSize));
-        }
-
-        setBatchProgress({ current: 0, total: batches.length, active: true });
-
-        // Optimistically update status to processing locally so it shows immediately
+        toast.success('Campaign started in the background! Emails are being processed by QStash.');
         if (upload) {
           setUpload({ ...upload, status: 'processing' });
         }
-
-        for (let i = 0; i < batches.length; i++) {
-          const batch = batches[i];
-          const contactIds = batch.map((c) => c.id);
-
-          await uploadApi.sendBatch(id, {
-            templateId: selectedTemplateId,
-            contactIds,
-          });
-
-          setBatchProgress({ current: i + 1, total: batches.length, active: true });
-
-          // Refresh list / stats in background
-          fetchDetails();
-
-          // Sleep between batches to honor rate limits
-          if (i < batches.length - 1) {
-            let countdown = Math.ceil(batchDelayMs / 1000);
-            setNextBatchCountdown(countdown);
-
-            const timer = setInterval(() => {
-              countdown -= 1;
-              if (countdown <= 0) {
-                clearInterval(timer);
-                setNextBatchCountdown(null);
-              } else {
-                setNextBatchCountdown(countdown);
-              }
-            }, 1000);
-
-            await new Promise((resolve) => setTimeout(resolve, batchDelayMs));
-            clearInterval(timer);
-            setNextBatchCountdown(null);
-          }
-        }
-
-        const finalizeRes = await uploadApi.finalizeSend(id);
-        toast.success(`Email sending completed! Status: ${finalizeRes.data.status}`);
       } else {
         await uploadApi.finalizeSend(id);
         toast.success('Campaign finalized (all contacts skipped or unsubscribed).');
       }
 
-      setBatchProgress(null);
       fetchDetails();
     } catch (err: any) {
       toast.error(err.response?.data?.message || 'Failed to initiate send');
-      setBatchProgress(null);
       fetchDetails();
     } finally {
       setSending(false);
@@ -547,26 +499,12 @@ export default function UploadDetails() {
       )}
 
       {/* Processing indicator */}
-      {(upload.status === 'processing' || (batchProgress && batchProgress.active)) && (
-        <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-4 space-y-3">
-          <div className="flex items-center gap-3">
-            <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
-            <p className="text-sm text-blue-400 font-medium">
-              {batchProgress && batchProgress.active
-                ? nextBatchCountdown !== null
-                  ? `Batch ${batchProgress.current} of ${batchProgress.total} completed. Pausing for rate limits... Next batch in ${Math.floor(nextBatchCountdown / 60)}:${String(nextBatchCountdown % 60).padStart(2, '0')} mins.`
-                  : `Sending emails... Batch ${batchProgress.current + 1} of ${batchProgress.total} in progress.`
-                : 'Sending emails in progress...'}
-            </p>
-          </div>
-          {batchProgress && batchProgress.active && (
-            <div className="w-full bg-white/5 rounded-full h-2 overflow-hidden border border-white/5">
-              <div
-                className="bg-brand-500 h-full transition-all duration-300 rounded-full"
-                style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
-              />
-            </div>
-          )}
+      {upload.status === 'processing' && (
+        <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-4 flex items-center gap-3">
+          <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
+          <p className="text-sm text-blue-400 font-medium">
+            Sending emails in progress...
+          </p>
         </div>
       )}
 
