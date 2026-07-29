@@ -694,11 +694,7 @@ apiRouter.post('/qstash/process-campaign', verifyQstashSignature, catchAsync(asy
 
   return res.status(200).json({ success: true, contact: contact.email, sentSuccessfully });
 }));
-<<<<<<< HEAD
-=======
-
 app.use('/api', apiRouter);
->>>>>>> c34909c0342efa4efd6220b9514584086fc09708
 
 const PORT = process.env.PORT || 7071;
 app.listen(PORT, () => {
