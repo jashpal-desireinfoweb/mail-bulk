@@ -695,6 +695,8 @@ apiRouter.post('/qstash/process-campaign', verifyQstashSignature, catchAsync(asy
   return res.status(200).json({ success: true, contact: contact.email, sentSuccessfully });
 }));
 
+app.use('/api', apiRouter);
+
 const PORT = process.env.PORT || 7071;
 app.listen(PORT, () => {
   console.log(`[Express Started] Backend listening on port ${PORT}`);
