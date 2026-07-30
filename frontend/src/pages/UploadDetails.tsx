@@ -378,7 +378,7 @@ export default function UploadDetails() {
       setIsSendModalOpen(false);
 
       if (queuedContacts && queuedContacts.length > 0) {
-        toast.success('Campaign started in the background! Emails are being processed by QStash.');
+        toast.success('Campaign started in the background! Emails are being processed.');
         if (upload) {
           setUpload({ ...upload, status: 'processing' });
         }

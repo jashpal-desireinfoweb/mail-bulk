@@ -10,13 +10,6 @@ const { sendEmail } = require('./email');
 const { renderTemplate, invalidateTemplate } = require('./templates-service');
 
 require('dotenv').config();
-const { Receiver, Client } = require('@upstash/qstash');
-
-const qstashClient = new Client({ token: process.env.QSTASH_TOKEN || 'dummy' });
-const qstashReceiver = new Receiver({
-  currentSigningKey: process.env.QSTASH_CURRENT_SIGNING_KEY || 'dummy',
-  nextSigningKey: process.env.QSTASH_NEXT_SIGNING_KEY || 'dummy',
-});
 
 // --- Rate Limit Settings for Email Sending (Human-like Random Delays) ---
 const EMAIL_BATCH_SIZE = parseInt(process.env.EMAIL_BATCH_SIZE || '1', 10);
@@ -202,6 +195,150 @@ async function checkUploadCompletion(uploadId) {
   }
   return upload.status;
 }
+
+// Track active running campaigns to prevent duplicate worker loops
+const activeRunningCampaigns = new Set();
+
+// --- Background Campaign Processor ---
+async function processCampaignInBackground(uploadId, templateId) {
+  if (activeRunningCampaigns.has(uploadId)) return;
+  activeRunningCampaigns.add(uploadId);
+
+  try {
+    const upload = await prisma.upload.findUnique({ where: { id: uploadId } });
+    if (!upload) return;
+    if (upload.status !== 'processing' && upload.status !== 'scheduled') return;
+
+    if (upload.status === 'scheduled') {
+      await prisma.upload.update({
+        where: { id: uploadId },
+        data: { status: 'processing', scheduledAt: null },
+      });
+    }
+
+    const template = await prisma.template.findUnique({ where: { id: templateId } });
+    if (!template) {
+      console.error(`❌ [Campaign Error] Upload ${uploadId} missing template ID ${templateId}`);
+      await prisma.upload.update({ where: { id: uploadId }, data: { status: 'failed' } });
+      return;
+    }
+
+    const pendingContacts = await prisma.contact.findMany({
+      where: { uploadId, deliveryStatus: 'pending' },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (pendingContacts.length === 0) {
+      await checkUploadCompletion(uploadId);
+      console.log(`🎉 [Campaign Completed] Upload ID ${uploadId}: All contacts processed.`);
+      return;
+    }
+
+    console.log(`\n🚀 [Campaign Worker] Processing ${pendingContacts.length} pending emails for campaign "${upload.originalName}" (${uploadId})...`);
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+    for (let i = 0; i < pendingContacts.length; i++) {
+      const contact = pendingContacts[i];
+
+      const token = crypto.createHash('sha256').update(contact.email + 'desire-unsubscribe-salt').digest('hex').substring(0, 32);
+      const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
+
+      const variables = { name: contact.name, email: contact.email, unsubscribeLink };
+      const rendered = renderTemplate(
+        { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
+        variables
+      );
+
+      console.log(`  📧 [Email ${i + 1}/${pendingContacts.length}] Sending to ${contact.email} (${contact.name})...`);
+
+      let sentSuccessfully = false;
+      let lastError = null;
+      let attempts = 0;
+
+      while (attempts < 3) {
+        try {
+          const result = await sendEmail({
+            to: contact.email,
+            subject: rendered.subject,
+            html: rendered.html,
+            text: rendered.text,
+          });
+          sentSuccessfully = true;
+          console.log(`  ✅ [Success] Sent to ${contact.email} | Provider: ${result.provider} | ID: ${result.messageId}`);
+          break;
+        } catch (err) {
+          attempts++;
+          lastError = err;
+          console.warn(`  ⚠️ [Retry ${attempts}/3] Failed to send to ${contact.email}: ${err.message}`);
+          if (attempts < 3) await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+
+      await prisma.contact.update({
+        where: { id: contact.id },
+        data: {
+          deliveryStatus: sentSuccessfully ? 'sent' : 'failed',
+          deliveryError: sentSuccessfully ? null : (lastError?.message || 'Failed to deliver email'),
+          sentAt: new Date(),
+        },
+      });
+
+      await prisma.upload.update({
+        where: { id: uploadId },
+        data: {
+          sentCount: sentSuccessfully ? { increment: 1 } : undefined,
+          failedCount: !sentSuccessfully ? { increment: 1 } : undefined,
+          pendingCount: { decrement: 1 },
+        },
+      });
+
+      if (i < pendingContacts.length - 1) {
+        const delayMs = EMAIL_BATCH_DELAY_MS > 0 ? EMAIL_BATCH_DELAY_MS : 1000;
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+
+    const finalStatus = await checkUploadCompletion(uploadId);
+    console.log(`🎉 [Campaign Finished] Campaign "${upload.originalName}" finished with status: "${finalStatus}"\n`);
+  } catch (err) {
+    console.error(`❌ [Worker Error] Campaign ${uploadId}:`, err.message);
+  } finally {
+    activeRunningCampaigns.delete(uploadId);
+  }
+}
+
+// --- Background Worker Loop for Dev & Recovery (runs every 10s) ---
+setInterval(async () => {
+  try {
+    const now = new Date();
+
+    // 1. Scheduled campaigns due
+    const dueUploads = await prisma.upload.findMany({
+      where: { status: 'scheduled', scheduledAt: { lte: now } },
+    });
+
+    for (const upload of dueUploads) {
+      if (upload.templateId) {
+        console.log(`⏰ [Scheduler Worker] Triggering scheduled campaign "${upload.originalName}" (${upload.id})...`);
+        processCampaignInBackground(upload.id, upload.templateId);
+      }
+    }
+
+    // 2. Resume processing campaigns with pending contacts
+    const processingUploads = await prisma.upload.findMany({
+      where: { status: 'processing', pendingCount: { gt: 0 } },
+    });
+
+    for (const upload of processingUploads) {
+      if (upload.templateId) {
+        processCampaignInBackground(upload.id, upload.templateId);
+      }
+    }
+  } catch (_err) {
+    // Ignore quiet polling errors
+  }
+}, 10000);
 
 // --- Helper: re-evaluate duplicate status for specific emails ---
 async function revalidateDuplicatesForEmails(uploadId, emails) {
@@ -416,6 +553,198 @@ apiRouter.get('/uploads/:id/stats', catchAsync(async (req, res) => {
   return res.status(200).json(upload);
 }));
 
+// GET /uploads/:id/contacts — Paginated contacts for an upload
+apiRouter.get('/uploads/:id/contacts', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit || '50', 10)));
+  const skip = (page - 1) * limit;
+
+  const [contacts, total] = await Promise.all([
+    prisma.contact.findMany({
+      where: { uploadId: id },
+      orderBy: { createdAt: 'asc' },
+      skip,
+      take: limit,
+    }),
+    prisma.contact.count({ where: { uploadId: id } }),
+  ]);
+
+  const totalPages = Math.ceil(total / limit) || 1;
+  return res.status(200).json({ contacts, total, page, limit, totalPages });
+}));
+
+// GET /uploads/:id — Fetch single upload with template (generic route must come after specific routes)
+apiRouter.get('/uploads/:id', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+  const upload = await prisma.upload.findUnique({
+    where: { id },
+    include: { template: true },
+  });
+  if (!upload) return res.status(404).json({ message: 'Upload not found' });
+  return res.status(200).json(upload);
+}));
+
+// PUT /uploads/:id — Update upload label/fileName
+apiRouter.put('/uploads/:id', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+  const { fileName, originalName } = req.body;
+
+  const upload = await prisma.upload.findUnique({ where: { id } });
+  if (!upload) return res.status(404).json({ message: 'Upload not found' });
+
+  const updated = await prisma.upload.update({
+    where: { id },
+    data: {
+      fileName: fileName !== undefined ? fileName : upload.fileName,
+      originalName: originalName !== undefined ? originalName : upload.originalName,
+    },
+  });
+
+  return res.status(200).json(updated);
+}));
+
+// DELETE /uploads/:id — Permanently delete an upload and all associated contacts
+apiRouter.delete('/uploads/:id', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+
+  const upload = await prisma.upload.findUnique({ where: { id } });
+  if (!upload) return res.status(404).json({ message: 'Upload not found' });
+
+  // Delete all contacts belonging to this upload first, then delete upload
+  await prisma.contact.deleteMany({ where: { uploadId: id } });
+  await prisma.upload.delete({ where: { id } });
+
+  return res.status(200).json({ message: 'Upload history deleted successfully' });
+}));
+
+// POST /uploads/:id/finalize — Check & finalize upload sending status
+apiRouter.post('/uploads/:id/finalize', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+
+  const status = await checkUploadCompletion(id);
+  return res.status(200).json({ status });
+}));
+
+// PUT /contacts/:id — Update a single contact in a list
+apiRouter.put('/contacts/:id', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+  const { name, email } = req.body;
+
+  const contact = await prisma.contact.findUnique({ where: { id } });
+  if (!contact) return res.status(404).json({ message: 'Contact not found' });
+
+  const updatedEmail = email ? email.trim().toLowerCase() : contact.email;
+  const updatedName = name !== undefined ? name.trim() : contact.name;
+
+  const updatedContact = await prisma.contact.update({
+    where: { id },
+    data: { name: updatedName, email: updatedEmail },
+  });
+
+  await revalidateDuplicatesForEmails(contact.uploadId, [updatedEmail, contact.email]);
+  const newCounts = await recountUploadStats(contact.uploadId);
+  await prisma.upload.update({ where: { id: contact.uploadId }, data: newCounts });
+
+  return res.status(200).json(updatedContact);
+}));
+
+// DELETE /contacts/:id — Delete a single contact from a list
+apiRouter.delete('/contacts/:id', catchAsync(async (req, res) => {
+  const { id } = req.params;
+  await authenticate(req);
+
+  const contact = await prisma.contact.findUnique({ where: { id } });
+  if (!contact) return res.status(404).json({ message: 'Contact not found' });
+
+  await prisma.contact.delete({ where: { id } });
+
+  await revalidateDuplicatesForEmails(contact.uploadId, [contact.email]);
+  const newCounts = await recountUploadStats(contact.uploadId);
+  await prisma.upload.update({ where: { id: contact.uploadId }, data: newCounts });
+
+  return res.status(200).json({ message: 'Contact deleted successfully' });
+}));
+
+// GET /contacts/logs — Delivery Logs Endpoint with Pagination & Filtering
+apiRouter.get('/contacts/logs', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '10', 10)));
+  const skip = (page - 1) * limit;
+
+  const { status, search, startDate, endDate } = req.query;
+  const where = {};
+
+  if (status && status !== 'all') {
+    where.deliveryStatus = String(status);
+  }
+
+  if (search && String(search).trim() !== '') {
+    const searchStr = String(search).trim();
+    where.OR = [
+      { email: { contains: searchStr, mode: 'insensitive' } },
+      { name: { contains: searchStr, mode: 'insensitive' } },
+      { upload: { originalName: { contains: searchStr, mode: 'insensitive' } } },
+      { upload: { fileName: { contains: searchStr, mode: 'insensitive' } } },
+    ];
+  }
+
+  if (startDate || endDate) {
+    where.createdAt = {};
+    if (startDate) {
+      where.createdAt.gte = new Date(String(startDate));
+    }
+    if (endDate) {
+      const end = new Date(String(endDate));
+      end.setHours(23, 59, 59, 999);
+      where.createdAt.lte = end;
+    }
+  }
+
+  const [logs, total] = await Promise.all([
+    prisma.contact.findMany({
+      where,
+      include: {
+        upload: {
+          select: {
+            originalName: true,
+            fileName: true,
+            template: {
+              select: {
+                name: true,
+                subject: true,
+                htmlBody: true,
+                plainTextBody: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit,
+    }),
+    prisma.contact.count({ where }),
+  ]);
+
+  const totalPages = Math.ceil(total / limit) || 1;
+
+  return res.status(200).json({
+    logs,
+    total,
+    page,
+    limit,
+    totalPages,
+  });
+}));
+
 // POST /uploads/:id/send
 apiRouter.post('/uploads/:id/send', catchAsync(async (req, res) => {
   const { id } = req.params;
@@ -464,16 +793,10 @@ apiRouter.post('/uploads/:id/send', catchAsync(async (req, res) => {
     },
   });
 
-  const appUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : (process.env.APP_URL || process.env.FRONTEND_URL || `http://${req.get('host')}`);
-  try {
-    await qstashClient.publishJSON({
-      url: `${appUrl}/api/qstash/process-campaign`,
-      body: { uploadId: id, templateId },
-    });
-  } catch (err) {
-    console.error('QStash publish error:', err);
-    return res.status(500).json({ message: 'Failed to initiate campaign with QStash' });
-  }
+  // Launch background processor immediately
+  processCampaignInBackground(id, templateId).catch((err) => {
+    console.error(`❌ [Background Launch Error] Upload ${id}:`, err);
+  });
 
   const queuedContacts = contacts.filter((c) => !unsubscribedSet.has(c.email.toLowerCase()));
   return res.status(200).json({
@@ -514,20 +837,7 @@ apiRouter.post('/uploads/:id/schedule', catchAsync(async (req, res) => {
     return res.status(400).json({ message: 'scheduledAt must be a valid date in the future' });
   }
 
-  const appUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : (process.env.APP_URL || process.env.FRONTEND_URL || `http://${req.get('host')}`);
-  const delaySecs = Math.max(0, Math.floor((schedDate.getTime() - Date.now()) / 1000));
 
-  try {
-    const resQstash = await qstashClient.publishJSON({
-      url: `${appUrl}/api/qstash/process-campaign`,
-      body: { uploadId: id, templateId },
-      notBefore: Math.floor(schedDate.getTime() / 1000),
-    });
-    console.log('Scheduled in QStash:', resQstash.messageId);
-  } catch (err) {
-    console.error('QStash schedule error:', err);
-    return res.status(500).json({ message: 'Failed to schedule campaign with QStash' });
-  }
 
   const updatedUpload = await prisma.upload.update({
     where: { id },
@@ -576,125 +886,117 @@ apiRouter.post('/uploads/:id/unschedule', catchAsync(async (req, res) => {
   });
 }));
 
-
 // ============================================================
-// QStash Webhook Endpoint
+// Templates CRUD Endpoints
 // ============================================================
-async function verifyQstashSignature(req, res, next) {
-  try {
-    const signature = req.headers['upstash-signature'];
-    if (!signature) throw new Error('Missing signature');
-    
-    // QStash verification (simplified to use JSON.stringify body)
-    const isValid = await qstashReceiver.verify({
-      signature,
-      body: JSON.stringify(req.body)
-    });
-    
-    if (!isValid) throw new Error('Invalid signature');
-    next();
-  } catch (err) {
-    console.error('[QStash] Signature verification failed:', err.message);
-    // If you are having issues with signature verification due to body parsing, 
-    // uncomment the line below to fallback to no verification temporarily
-    // return next(); 
-    return res.status(401).json({ message: 'Invalid QStash signature' });
-  }
-}
 
-apiRouter.post('/qstash/process-campaign', verifyQstashSignature, catchAsync(async (req, res) => {
-  const { uploadId, templateId } = req.body;
-  
-  const upload = await prisma.upload.findUnique({ where: { id: uploadId } });
-  if (!upload) return res.status(404).json({ message: 'Upload not found' });
-  if (upload.status !== 'processing' && upload.status !== 'scheduled') {
-    return res.status(200).json({ message: 'Campaign is not active' });
-  }
-
-  // Set status to processing if it was scheduled
-  if (upload.status === 'scheduled') {
-    await prisma.upload.update({ where: { id: uploadId }, data: { status: 'processing', scheduledAt: null } });
-  }
-
-  const template = await prisma.template.findUnique({ where: { id: templateId } });
-  if (!template) {
-    await prisma.upload.update({ where: { id: uploadId }, data: { status: 'failed' } });
-    return res.status(404).json({ message: 'Template not found' });
-  }
-
-  const contact = await prisma.contact.findFirst({
-    where: { uploadId, deliveryStatus: 'pending' },
-    orderBy: { createdAt: 'asc' }
+// GET /templates
+apiRouter.get('/templates', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const templates = await prisma.template.findMany({
+    orderBy: { createdAt: 'desc' },
   });
+  return res.status(200).json(templates);
+}));
 
-  if (!contact) {
-    await checkUploadCompletion(uploadId);
-    return res.status(200).json({ message: 'No more pending contacts' });
+// GET /templates/:id
+apiRouter.get('/templates/:id', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const { id } = req.params;
+  const template = await prisma.template.findUnique({ where: { id } });
+  if (!template) return res.status(404).json({ message: 'Template not found' });
+  return res.status(200).json(template);
+}));
+
+// POST /templates
+apiRouter.post('/templates', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const { name, subject, htmlBody, plainTextBody } = req.body;
+  if (!name || !subject) {
+    return res.status(400).json({ message: 'Name and subject are required' });
+  }
+  const template = await prisma.template.create({
+    data: {
+      name,
+      subject,
+      htmlBody: htmlBody || '',
+      plainTextBody: plainTextBody || '',
+    },
+  });
+  return res.status(201).json(template);
+}));
+
+// PUT /templates/:id
+apiRouter.put('/templates/:id', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const { id } = req.params;
+  const { name, subject, htmlBody, plainTextBody } = req.body;
+  const existing = await prisma.template.findUnique({ where: { id } });
+  if (!existing) return res.status(404).json({ message: 'Template not found' });
+
+  const updated = await prisma.template.update({
+    where: { id },
+    data: {
+      name: name !== undefined ? name : existing.name,
+      subject: subject !== undefined ? subject : existing.subject,
+      htmlBody: htmlBody !== undefined ? htmlBody : existing.htmlBody,
+      plainTextBody: plainTextBody !== undefined ? plainTextBody : existing.plainTextBody,
+    },
+  });
+  invalidateTemplate(id);
+  return res.status(200).json(updated);
+}));
+
+// DELETE /templates/:id
+apiRouter.delete('/templates/:id', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const { id } = req.params;
+  const existing = await prisma.template.findUnique({ where: { id } });
+  if (!existing) return res.status(404).json({ message: 'Template not found' });
+
+  await prisma.template.delete({ where: { id } });
+  invalidateTemplate(id);
+  return res.status(200).json({ message: 'Template deleted successfully' });
+}));
+
+// POST /templates/:id/test
+apiRouter.post('/templates/:id/test', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const { id } = req.params;
+  const { testEmail } = req.body;
+
+  if (!testEmail) {
+    return res.status(400).json({ message: 'Test email is required' });
   }
 
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-  const token = crypto.createHash('sha256').update(contact.email + 'desire-unsubscribe-salt').digest('hex').substring(0, 32);
-  const unsubscribeLink = `${frontendUrl}/unsubscribe/${token}`;
-  
-  const variables = { name: contact.name, email: contact.email, unsubscribeLink };
+  const template = await prisma.template.findUnique({ where: { id } });
+  if (!template) return res.status(404).json({ message: 'Template not found' });
+
   const rendered = renderTemplate(
     { id: template.id, subject: template.subject, htmlBody: template.htmlBody, plainTextBody: template.plainTextBody },
-    variables
+    { name: 'Test User', email: testEmail, unsubscribeLink: '#' }
   );
 
-  let sentSuccessfully = false;
-  let lastError = null;
-  let attempts = 0;
-  while (attempts < 3) {
-    try {
-      await sendEmail({ to: contact.email, subject: rendered.subject, html: rendered.html, text: rendered.text });
-      sentSuccessfully = true;
-      break;
-    } catch (err) {
-      attempts++;
-      lastError = err;
-      if (attempts < 3) await new Promise(r => setTimeout(r, 1000));
-    }
-  }
-
-  await prisma.contact.update({
-    where: { id: contact.id },
-    data: {
-      deliveryStatus: sentSuccessfully ? 'sent' : 'failed',
-      deliveryError: sentSuccessfully ? null : (lastError?.message || 'Failed'),
-      sentAt: new Date()
-    }
+  await sendEmail({
+    to: testEmail,
+    subject: `[TEST] ${rendered.subject}`,
+    html: rendered.html,
+    text: rendered.text,
   });
 
-  await prisma.upload.update({
-    where: { id: uploadId },
-    data: {
-      sentCount: sentSuccessfully ? { increment: 1 } : undefined,
-      failedCount: !sentSuccessfully ? { increment: 1 } : undefined,
-      pendingCount: { decrement: 1 }
-    }
-  });
-
-  const remaining = await prisma.contact.count({ where: { uploadId, deliveryStatus: 'pending' } });
-  if (remaining > 0) {
-    // Generate human-like random delay
-    const delaySecs = Math.max(20, Math.floor(getRandomIndividualDelayMs() / 1000));
-    const appUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : (process.env.APP_URL || process.env.FRONTEND_URL || `http://${req.get('host')}`);
-    
-    await qstashClient.publishJSON({
-      url: `${appUrl}/api/qstash/process-campaign`,
-      body: { uploadId, templateId },
-      delay: `${delaySecs}s`,
-    });
-    console.log(`[QStash] Sent 1 email. Scheduled next batch for ${delaySecs} seconds from now.`);
-  } else {
-    await checkUploadCompletion(uploadId);
-    console.log(`[QStash] Campaign ${uploadId} completed!`);
-  }
-
-  return res.status(200).json({ success: true, contact: contact.email, sentSuccessfully });
+  return res.status(200).json({ message: `Test email sent to ${testEmail}` });
 }));
+
 app.use('/api', apiRouter);
+
+// --- Global Error Handling Middleware ---
+app.use((err, req, res, _next) => {
+  if (err.message === 'Unauthorized') {
+    return res.status(401).json({ message: 'Unauthorized access: Please login first' });
+  }
+  console.error('[API Error]', err.stack || err);
+  return res.status(500).json({ message: err.message || 'Internal Server Error' });
+});
 
 const PORT = process.env.PORT || 7071;
 app.listen(PORT, () => {
