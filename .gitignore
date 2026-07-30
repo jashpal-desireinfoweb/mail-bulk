@@ -58,3 +58,7 @@ __azurite_db_*__.json
 __blobstorage__
 __queuestorage__
 __tablestorage__
+
+# Azure Functions (Deployed separately to Azure Function App)
+functions/
+

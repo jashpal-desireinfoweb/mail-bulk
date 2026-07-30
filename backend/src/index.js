@@ -120,8 +120,8 @@ const VALID_TRANSITIONS = {
   idle: ['processing', 'scheduled'],
   scheduled: ['idle', 'processing', 'scheduled'],
   processing: ['completed', 'failed'],
-  completed: [],
-  failed: ['idle'],
+  completed: ['idle', 'processing', 'scheduled'],
+  failed: ['idle', 'processing', 'scheduled'],
 };
 
 function assertCanTransition(current, next) {
@@ -194,6 +194,37 @@ async function checkUploadCompletion(uploadId) {
     return finalStatus;
   }
   return upload.status;
+}
+
+// --- Helper: Dispatch campaign to Azure Durable Functions (Production) or Local Worker ---
+async function dispatchCampaignOrchestration(uploadId, templateId, scheduledAt = null) {
+  const durableStarterUrl = process.env.DURABLE_STARTER_URL;
+  const durableFunctionKey = process.env.DURABLE_FUNCTION_KEY;
+
+  if (durableStarterUrl) {
+    try {
+      const url = durableFunctionKey
+        ? `${durableStarterUrl}?code=${durableFunctionKey}`
+        : durableStarterUrl;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, templateId, scheduledAt }),
+      });
+      const data = await res.json();
+      console.log(`[Durable Starter Success] Upload ${uploadId}:`, data);
+      return;
+    } catch (err) {
+      console.error(`[Durable Starter Error] Upload ${uploadId}:`, err.message);
+    }
+  }
+
+  // Fallback: Local In-Process Worker
+  if (!scheduledAt || new Date(scheduledAt) <= new Date()) {
+    processCampaignInBackground(uploadId, templateId).catch((err) => {
+      console.error(`❌ [Background Launch Error] Upload ${uploadId}:`, err);
+    });
+  }
 }
 
 // Track active running campaigns to prevent duplicate worker loops
@@ -793,9 +824,9 @@ apiRouter.post('/uploads/:id/send', catchAsync(async (req, res) => {
     },
   });
 
-  // Launch background processor immediately
-  processCampaignInBackground(id, templateId).catch((err) => {
-    console.error(`❌ [Background Launch Error] Upload ${id}:`, err);
+  // Launch background processor or Azure Durable Orchestrator
+  dispatchCampaignOrchestration(id, templateId).catch((err) => {
+    console.error(`❌ [Dispatch Launch Error] Upload ${id}:`, err);
   });
 
   const queuedContacts = contacts.filter((c) => !unsubscribedSet.has(c.email.toLowerCase()));
@@ -839,13 +870,42 @@ apiRouter.post('/uploads/:id/schedule', catchAsync(async (req, res) => {
 
 
 
+  const contacts = await prisma.contact.findMany({ where: { uploadId: id, status: 'valid' } });
+  if (contacts.length === 0) {
+    return res.status(400).json({ message: 'No valid contacts found in this upload' });
+  }
+
+  const unsubscribedSet = await getUnsubscribedSet();
+  const unsubscribedArray = [...unsubscribedSet];
+
+  const [skippedResult, pendingResult] = await Promise.all([
+    prisma.contact.updateMany({
+      where: { uploadId: id, status: 'valid', email: { in: unsubscribedArray } },
+      data: { deliveryStatus: 'skipped', deliveryError: 'Email is unsubscribed' },
+    }),
+    prisma.contact.updateMany({
+      where: { uploadId: id, status: 'valid', email: { notIn: unsubscribedArray } },
+      data: { deliveryStatus: 'pending' },
+    }),
+  ]);
+
   const updatedUpload = await prisma.upload.update({
     where: { id },
     data: {
       status: 'scheduled',
       templateId,
       scheduledAt: schedDate,
+      totalCount: contacts.length,
+      pendingCount: pendingResult.count,
+      skippedCount: skippedResult.count,
+      sentCount: 0,
+      failedCount: 0,
     },
+  });
+
+  // Dispatch scheduled campaign to Azure Durable Functions (if DURABLE_STARTER_URL configured)
+  dispatchCampaignOrchestration(id, templateId, schedDate).catch((err) => {
+    console.error(`❌ [Dispatch Schedule Error] Upload ${id}:`, err);
   });
 
   return res.status(200).json({
