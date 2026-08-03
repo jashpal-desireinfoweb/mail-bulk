@@ -8,6 +8,7 @@ const { prisma, ContactStatus } = require('./prisma');
 const { generateToken, comparePassword, hashPassword, authenticate } = require('./auth');
 const { sendEmail } = require('./email');
 const { renderTemplate, invalidateTemplate } = require('./templates-service');
+const { recountUploadStats, checkUploadCompletion } = require('./upload-helpers');
 
 require('dotenv').config();
 
@@ -130,32 +131,6 @@ function assertCanTransition(current, next) {
   }
 }
 
-// --- Helper: aggregate upload stats in ONE query ---
-async function recountUploadStats(uploadId) {
-  const [statusRows, deliveryRows] = await Promise.all([
-    prisma.$queryRaw`
-      SELECT
-        COUNT(*)::int                                          AS "totalRows",
-        COUNT(*) FILTER (WHERE status = 'valid')::int         AS "validEmails",
-        COUNT(*) FILTER (WHERE status = 'invalid')::int       AS "invalidEmails",
-        COUNT(*) FILTER (WHERE status = 'duplicate')::int     AS "duplicateEmails",
-        COUNT(*) FILTER (WHERE status = 'unsubscribed')::int  AS "unsubscribedEmails"
-      FROM contacts
-      WHERE upload_id = ${uploadId}
-    `,
-    prisma.$queryRaw`
-      SELECT
-        COUNT(*) FILTER (WHERE delivery_status = 'sent')::int     AS "sentCount",
-        COUNT(*) FILTER (WHERE delivery_status = 'failed')::int   AS "failedCount",
-        COUNT(*) FILTER (WHERE delivery_status = 'pending')::int  AS "pendingCount",
-        COUNT(*) FILTER (WHERE delivery_status = 'skipped')::int  AS "skippedCount"
-      FROM contacts
-      WHERE upload_id = ${uploadId}
-    `,
-  ]);
-  return { ...statusRows[0], ...deliveryRows[0] };
-}
-
 // --- Helper: mask email for GDPR compliance ---
 function maskEmail(email) {
   const parts = email.split('@');
@@ -163,37 +138,6 @@ function maskEmail(email) {
   const [user, domain] = parts;
   const maskedUser = user.length > 2 ? user[0] + '***' + user[user.length - 1] : '***';
   return `${maskedUser}@${domain}`;
-}
-
-// --- Helper: finalize upload status after all batches done ---
-async function checkUploadCompletion(uploadId) {
-  const upload = await prisma.upload.findUnique({ where: { id: uploadId } });
-  if (!upload) return 'failed';
-
-  const pendingCount = await prisma.contact.count({
-    where: { uploadId, deliveryStatus: 'pending' },
-  });
-
-  if (pendingCount === 0) {
-    // Recount stats to ensure the upload counters are perfectly synchronized
-    const counts = await recountUploadStats(uploadId);
-    let finalStatus = upload.status;
-    if (upload.status === 'processing') {
-      finalStatus = counts.failedCount > 0 && counts.sentCount === 0 ? 'failed' : 'completed';
-    }
-    await prisma.upload.update({
-      where: { id: uploadId },
-      data: {
-        status: finalStatus,
-        sentCount: counts.sentCount,
-        failedCount: counts.failedCount,
-        pendingCount: counts.pendingCount,
-        skippedCount: counts.skippedCount,
-      },
-    });
-    return finalStatus;
-  }
-  return upload.status;
 }
 
 // --- Helper: Dispatch campaign to Azure Durable Functions (Production) or Local Worker ---
@@ -340,7 +284,11 @@ async function processCampaignInBackground(uploadId, templateId) {
 }
 
 // --- Background Worker Loop for Dev & Recovery (runs every 10s) ---
+// Skipped entirely when DURABLE_STARTER_URL is set — the Durable Functions
+// orchestrator owns scheduling/resumption in that case, and running both
+// causes the same campaign to be processed twice concurrently.
 setInterval(async () => {
+  if (process.env.DURABLE_STARTER_URL) return;
   try {
     const now = new Date();
 
@@ -420,18 +368,6 @@ const apiRouter = express.Router();
 apiRouter.get('/health', catchAsync(async (_req, res) => {
   const dbOk = await prisma.$queryRaw`SELECT 1`.then(() => true).catch(() => false);
   res.status(dbOk ? 200 : 503).json({ status: dbOk ? 'ok' : 'degraded', db: dbOk });
-}));
-
-// GET /cron/check-scheduler
-apiRouter.get('/cron/check-scheduler', catchAsync(async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  const cronSecret = process.env.CRON_SECRET;
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
-    return res.status(401).json({ message: 'Unauthorized cron trigger' });
-  }
-
-  const results = await runSchedulerIncrementally();
-  return res.status(200).json({ success: true, ...results });
 }));
 
 // POST /auth/login
