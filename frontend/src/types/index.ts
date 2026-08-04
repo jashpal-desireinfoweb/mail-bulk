@@ -19,7 +19,7 @@ export interface Upload {
   invalidEmails: number;
   duplicateEmails: number;
   unsubscribedEmails: number;
-  status: 'idle' | 'scheduled' | 'processing' | 'completed' | 'failed';
+  status: 'idle' | 'scheduled' | 'processing' | 'completed' | 'completed_with_errors' | 'failed';
   totalCount: number;
   sentCount: number;
   failedCount: number;
@@ -39,6 +39,7 @@ export interface Contact {
   error: string | null;
   deliveryStatus: 'idle' | 'pending' | 'sent' | 'failed' | 'skipped';
   deliveryError: string | null;
+  deliveryProvider: string | null;
   sentAt: string | null;
   uploadId: string;
   createdAt: string;

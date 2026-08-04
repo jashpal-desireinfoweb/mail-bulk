@@ -58,9 +58,10 @@ model Contact {
   upload   Upload  @relation(fields: [uploadId], references: [id], onDelete: Cascade)
 
   // Delivery fields
-  deliveryStatus String    @default("idle") @map("delivery_status")
-  deliveryError  String?   @map("delivery_error")
-  sentAt         DateTime? @map("sent_at")
+  deliveryStatus   String    @default("idle") @map("delivery_status")
+  deliveryError    String?   @map("delivery_error")
+  deliveryProvider String?   @map("delivery_provider")
+  sentAt           DateTime? @map("sent_at")
 
   createdAt DateTime @default(now()) @map("created_at")
 

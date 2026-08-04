@@ -39,7 +39,13 @@ async function checkUploadCompletion(uploadId) {
     const counts = await recountUploadStats(uploadId);
     let finalStatus = upload.status;
     if (upload.status === 'processing') {
-      finalStatus = counts.failedCount > 0 && counts.sentCount === 0 ? 'failed' : 'completed';
+      if (counts.sentCount === 0 && counts.failedCount > 0) {
+        finalStatus = 'failed';
+      } else if (counts.failedCount > 0) {
+        finalStatus = 'completed_with_errors';
+      } else {
+        finalStatus = 'completed';
+      }
     }
     await prisma.upload.update({
       where: { id: uploadId },

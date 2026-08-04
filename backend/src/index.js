@@ -120,8 +120,9 @@ function invalidateUnsubscribedCache() {
 const VALID_TRANSITIONS = {
   idle: ['processing', 'scheduled'],
   scheduled: ['idle', 'processing', 'scheduled'],
-  processing: ['completed', 'failed'],
+  processing: ['completed', 'completed_with_errors', 'failed'],
   completed: ['idle', 'processing', 'scheduled'],
+  completed_with_errors: ['idle', 'processing', 'scheduled'],
   failed: ['idle', 'processing', 'scheduled'],
 };
 
@@ -229,6 +230,7 @@ async function processCampaignInBackground(uploadId, templateId) {
 
       let sentSuccessfully = false;
       let lastError = null;
+      let deliveryProvider = null;
       let attempts = 0;
 
       while (attempts < 3) {
@@ -240,6 +242,7 @@ async function processCampaignInBackground(uploadId, templateId) {
             text: rendered.text,
           });
           sentSuccessfully = true;
+          deliveryProvider = result.provider;
           console.log(`  ✅ [Success] Sent to ${contact.email} | Provider: ${result.provider} | ID: ${result.messageId}`);
           break;
         } catch (err) {
@@ -255,6 +258,7 @@ async function processCampaignInBackground(uploadId, templateId) {
         data: {
           deliveryStatus: sentSuccessfully ? 'sent' : 'failed',
           deliveryError: sentSuccessfully ? null : (lastError?.message || 'Failed to deliver email'),
+          deliveryProvider,
           sentAt: new Date(),
         },
       });

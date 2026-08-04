@@ -356,6 +356,9 @@ export default function DeliveryLogs() {
                     </td>
                     <td className="px-6 py-4">
                       <StatusBadge status={log.deliveryStatus} />
+                      {log.deliveryStatus === 'sent' && log.deliveryProvider && (
+                        <div className="text-[10px] text-gray-500 mt-1 uppercase tracking-wide">via {log.deliveryProvider}</div>
+                      )}
                     </td>
                     <td className="px-6 py-4 text-gray-400">
                       {log.sentAt ? (
@@ -477,6 +480,12 @@ export default function DeliveryLogs() {
                       <StatusBadge status={selectedLog.deliveryStatus} />
                     </span>
                   </div>
+                  {selectedLog.deliveryStatus === 'sent' && selectedLog.deliveryProvider && (
+                    <div>
+                      <span className="text-gray-500 font-semibold inline-block w-16">Provider:</span>
+                      <span className="text-white font-medium uppercase">{selectedLog.deliveryProvider}</span>
+                    </div>
+                  )}
                 </div>
                 {selectedLog.sentAt && (
                   <div>

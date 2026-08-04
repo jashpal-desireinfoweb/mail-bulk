@@ -61,6 +61,5 @@ __queuestorage__
 __tablestorage__
 backend/.azurite/
 
-# Azure Functions (Deployed separately to Azure Function App)
-functions/
-
+.vercel
+.env*
