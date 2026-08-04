@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Upload, FileText, Send, AlertTriangle } from 'lucide-react';
+import { Upload, FileText, Send, AlertTriangle, Mail } from 'lucide-react';
 import StatsCard from '../components/StatsCard';
 import { uploadApi } from '../api/upload.api';
-import { DashboardStats } from '../types';
+import { DashboardStats, ProviderUsage } from '../types';
 
 export default function Dashboard() {
   const navigate = useNavigate();
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [providerUsage, setProviderUsage] = useState<ProviderUsage[]>([]);
+  const [usageLoading, setUsageLoading] = useState(true);
 
   useEffect(() => {
     uploadApi
@@ -16,6 +18,12 @@ export default function Dashboard() {
       .then((res) => setStats(res.data))
       .catch(() => setStats({ totalUploads: 0, totalTemplates: 0, totalEmailsSent: 0, totalFailedEmails: 0 }))
       .finally(() => setLoading(false));
+
+    uploadApi
+      .getProviderUsage()
+      .then((res) => setProviderUsage(res.data.usage))
+      .catch(() => setProviderUsage([]))
+      .finally(() => setUsageLoading(false));
   }, []);
 
   const admin = JSON.parse(localStorage.getItem('desire_admin') || '{}');
@@ -72,6 +80,69 @@ export default function Dashboard() {
           />
         </div>
       ) : null}
+
+      {/* Email Provider Capacity */}
+      <div>
+        <h2 className="section-title mb-4">Email Provider Capacity (Today)</h2>
+        <div className="glass-card overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-white/10 text-xs font-semibold text-gray-400 uppercase tracking-wider bg-white/[0.01]">
+                  <th className="px-6 py-3">Provider</th>
+                  <th className="px-6 py-3">Status</th>
+                  <th className="px-6 py-3">Sent Today</th>
+                  <th className="px-6 py-3">Daily Limit</th>
+                  <th className="px-6 py-3">Remaining</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/5 text-sm text-gray-300">
+                {usageLoading ? (
+                  [...Array(3)].map((_, i) => (
+                    <tr key={i} className="animate-pulse">
+                      <td className="px-6 py-3" colSpan={5}>
+                        <div className="h-4 bg-white/10 rounded w-full" />
+                      </td>
+                    </tr>
+                  ))
+                ) : providerUsage.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="text-center py-8 text-gray-500">
+                      <Mail className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                      Provider usage unavailable
+                    </td>
+                  </tr>
+                ) : (
+                  providerUsage.map((p) => {
+                    const isLow = p.remainingToday !== null && p.dailyLimit !== null && p.remainingToday / p.dailyLimit < 0.15;
+                    return (
+                      <tr key={p.provider} className="hover:bg-white/[0.03] transition-colors">
+                        <td className="px-6 py-3 font-semibold text-white uppercase">{p.provider}</td>
+                        <td className="px-6 py-3">
+                          {p.configured ? (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-lg border bg-emerald-500/15 text-emerald-400 border-emerald-500/20 text-xs font-medium">
+                              Configured
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-lg border bg-gray-500/15 text-gray-400 border-gray-500/20 text-xs font-medium">
+                              Not configured
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-6 py-3">{p.sentToday}</td>
+                        <td className="px-6 py-3">{p.dailyLimit === null ? 'Unlimited' : p.dailyLimit}</td>
+                        <td className={`px-6 py-3 font-semibold ${isLow ? 'text-red-400' : 'text-white'}`}>
+                          {p.remainingToday === null ? '—' : p.remainingToday}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
 
       {/* Quick Actions */}
       <div>

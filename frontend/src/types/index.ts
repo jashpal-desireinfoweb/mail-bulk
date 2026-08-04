@@ -104,3 +104,16 @@ export interface DashboardStats {
   totalFailedEmails: number;
 }
 
+export interface ProviderUsage {
+  provider: string;
+  configured: boolean;
+  dailyLimit: number | null;
+  sentToday: number;
+  remainingToday: number | null;
+}
+
+export interface ProviderUsageResponse {
+  usage: ProviderUsage[];
+  asOf: string;
+}
+

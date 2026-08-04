@@ -6,7 +6,7 @@ const XLSX = require('xlsx');
 const rateLimit = require('express-rate-limit');
 const { prisma, ContactStatus } = require('./prisma');
 const { generateToken, comparePassword, hashPassword, authenticate } = require('./auth');
-const { sendEmail } = require('./email');
+const { sendEmail, PROVIDER_META } = require('./email');
 const { renderTemplate, invalidateTemplate } = require('./templates-service');
 const { recountUploadStats, checkUploadCompletion } = require('./upload-helpers');
 
@@ -416,6 +416,35 @@ apiRouter.get('/uploads/stats/dashboard', catchAsync(async (req, res) => {
     prisma.contact.count({ where: { deliveryStatus: 'failed' } }),
   ]);
   return res.status(200).json({ totalUploads, totalTemplates, totalEmailsSent, totalFailedEmails });
+}));
+
+// GET /providers/usage — sent-today counts per provider vs. known free-tier daily limits
+apiRouter.get('/providers/usage', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const startOfToday = new Date();
+  startOfToday.setUTCHours(0, 0, 0, 0);
+
+  const counts = await prisma.contact.groupBy({
+    by: ['deliveryProvider'],
+    where: { deliveryStatus: 'sent', sentAt: { gte: startOfToday } },
+    _count: { _all: true },
+  });
+  const sentTodayByProvider = Object.fromEntries(
+    counts.map((c) => [c.deliveryProvider || 'unknown', c._count._all])
+  );
+
+  const usage = PROVIDER_META.map((p) => {
+    const sentToday = sentTodayByProvider[p.name] || 0;
+    return {
+      provider: p.name,
+      configured: p.configured,
+      dailyLimit: p.dailyLimit,
+      sentToday,
+      remainingToday: p.dailyLimit === null ? null : Math.max(0, p.dailyLimit - sentToday),
+    };
+  });
+
+  return res.status(200).json({ usage, asOf: new Date().toISOString() });
 }));
 
 // GET /uploads

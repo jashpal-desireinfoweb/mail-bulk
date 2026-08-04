@@ -1,5 +1,5 @@
 import api from './axios';
-import { Upload, ContactsResponse, DashboardStats, Contact, Template } from '../types';
+import { Upload, ContactsResponse, DashboardStats, Contact, Template, ProviderUsageResponse } from '../types';
 
 export const uploadApi = {
   uploadExcel: (file: File) => {
@@ -20,6 +20,8 @@ export const uploadApi = {
     }),
 
   getDashboardStats: () => api.get<DashboardStats>('/uploads/stats/dashboard'),
+
+  getProviderUsage: () => api.get<ProviderUsageResponse>('/providers/usage'),
 
   startSend: (id: string, templateId: string, smtpConfigId?: string) =>
     api.post<{

@@ -190,13 +190,23 @@ async function sendViaSMTP(options) {
 // rate-limit/quota errors, which providers surface as thrown errors) means no
 // manual send-count tracking is needed.
 const PROVIDER_CHAIN = [
-  { name: 'brevo', configured: isBrevoConfigured, send: sendViaBrevo },
-  { name: 'resend', configured: isResendConfigured, send: sendViaResend },
-  { name: 'sendgrid', configured: isSendGridConfigured, send: sendViaSendGrid },
-  { name: 'mailjet', configured: isMailjetConfigured, send: sendViaMailjet },
-  { name: 'mailersend', configured: isMailerSendConfigured, send: sendViaMailerSend },
-  { name: 'azure', configured: isAzureConfigured, send: sendViaAzure },
+  { name: 'brevo', configured: isBrevoConfigured, send: sendViaBrevo, dailyLimit: 300 },
+  { name: 'resend', configured: isResendConfigured, send: sendViaResend, dailyLimit: 100 },
+  { name: 'sendgrid', configured: isSendGridConfigured, send: sendViaSendGrid, dailyLimit: 100 },
+  { name: 'mailjet', configured: isMailjetConfigured, send: sendViaMailjet, dailyLimit: 200 },
+  { name: 'mailersend', configured: isMailerSendConfigured, send: sendViaMailerSend, dailyLimit: 100 },
+  { name: 'azure', configured: isAzureConfigured, send: sendViaAzure, dailyLimit: null },
 ];
+
+// Exposed for the /api/providers/usage endpoint — daily limits are the
+// documented free-tier caps for each provider, used to estimate remaining
+// capacity against our own send counts (not each provider's live account
+// balance, since not all providers expose that via API).
+const PROVIDER_META = PROVIDER_CHAIN.map((p) => ({
+  name: p.name,
+  configured: p.configured,
+  dailyLimit: p.dailyLimit,
+})).concat([{ name: 'smtp', configured: true, dailyLimit: null }]);
 
 async function sendEmail(options) {
   const errors = [];
@@ -225,4 +235,4 @@ async function sendEmail(options) {
   }
 }
 
-module.exports = { sendEmail };
+module.exports = { sendEmail, PROVIDER_META };
