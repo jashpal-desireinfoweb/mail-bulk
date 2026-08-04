@@ -761,7 +761,7 @@ apiRouter.post('/uploads/:id/send', catchAsync(async (req, res) => {
   });
 
   // Launch background processor or Azure Durable Orchestrator
-  dispatchCampaignOrchestration(id, templateId).catch((err) => {
+  await dispatchCampaignOrchestration(id, templateId).catch((err) => {
     console.error(`❌ [Dispatch Launch Error] Upload ${id}:`, err);
   });
 
@@ -840,7 +840,7 @@ apiRouter.post('/uploads/:id/schedule', catchAsync(async (req, res) => {
   });
 
   // Dispatch scheduled campaign to Azure Durable Functions (if DURABLE_STARTER_URL configured)
-  dispatchCampaignOrchestration(id, templateId, schedDate).catch((err) => {
+  await dispatchCampaignOrchestration(id, templateId, schedDate).catch((err) => {
     console.error(`❌ [Dispatch Schedule Error] Upload ${id}:`, err);
   });
 
