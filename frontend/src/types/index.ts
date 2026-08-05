@@ -117,3 +117,13 @@ export interface ProviderUsageResponse {
   asOf: string;
 }
 
+export interface ProviderSetting {
+  provider: string;
+  configured: boolean;
+  enabled: boolean;
+}
+
+export interface ProviderSettingsResponse {
+  settings: ProviderSetting[];
+}
+

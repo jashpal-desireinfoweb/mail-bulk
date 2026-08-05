@@ -1,5 +1,5 @@
 import api from './axios';
-import { Upload, ContactsResponse, DashboardStats, Contact, Template, ProviderUsageResponse } from '../types';
+import { Upload, ContactsResponse, DashboardStats, Contact, Template, ProviderUsageResponse, ProviderSettingsResponse } from '../types';
 
 export const uploadApi = {
   uploadExcel: (file: File) => {
@@ -22,6 +22,11 @@ export const uploadApi = {
   getDashboardStats: () => api.get<DashboardStats>('/uploads/stats/dashboard'),
 
   getProviderUsage: () => api.get<ProviderUsageResponse>('/providers/usage'),
+
+  getProviderSettings: () => api.get<ProviderSettingsResponse>('/providers/settings'),
+
+  setProviderEnabled: (provider: string, enabled: boolean) =>
+    api.put<{ message: string }>('/providers/settings', { provider, enabled }),
 
   startSend: (id: string, templateId: string, smtpConfigId?: string) =>
     api.post<{

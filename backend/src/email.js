@@ -5,6 +5,7 @@ const brevo = require('@getbrevo/brevo');
 const Mailjet = require('node-mailjet');
 const { MailerSend, EmailParams, Sender, Recipient } = require('mailersend');
 const { ClientSecretCredential } = require('@azure/identity');
+const { prisma } = require('./prisma');
 
 const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || '';
 const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Desire Mail';
@@ -197,6 +198,7 @@ const PROVIDER_CHAIN = [
   { name: 'mailjet', configured: isMailjetConfigured, send: sendViaMailjet, dailyLimit: 200 },
   { name: 'mailersend', configured: isMailerSendConfigured, send: sendViaMailerSend, dailyLimit: 100 },
   { name: 'azure', configured: isAzureConfigured, send: sendViaAzure, dailyLimit: null },
+  { name: 'graph', configured: isGraphConfigured, send: sendViaGraph, dailyLimit: null },
 ];
 
 // Exposed for the /api/providers/usage endpoint — daily limits are the
@@ -207,13 +209,37 @@ const PROVIDER_META = PROVIDER_CHAIN.map((p) => ({
   name: p.name,
   configured: p.configured,
   dailyLimit: p.dailyLimit,
-})).concat([{ name: 'graph', configured: isGraphConfigured, dailyLimit: null }]);
+}));
+
+// Cached provider on/off toggles (dashboard-controlled), short TTL so a
+// toggle flip takes effect quickly without hitting the DB on every send.
+let cachedProviderSettings = null;
+let cachedProviderSettingsTime = 0;
+const PROVIDER_SETTINGS_TTL_MS = 15000;
+
+async function getDisabledProviderSet() {
+  const now = Date.now();
+  if (cachedProviderSettings && now - cachedProviderSettingsTime < PROVIDER_SETTINGS_TTL_MS) {
+    return cachedProviderSettings;
+  }
+  const rows = await prisma.providerSetting.findMany({ where: { enabled: false } });
+  cachedProviderSettings = new Set(rows.map((r) => r.provider));
+  cachedProviderSettingsTime = now;
+  return cachedProviderSettings;
+}
+
+function invalidateProviderSettingsCache() {
+  cachedProviderSettings = null;
+  cachedProviderSettingsTime = 0;
+}
 
 async function sendEmail(options) {
   const errors = [];
+  const disabled = await getDisabledProviderSet();
 
   for (const provider of PROVIDER_CHAIN) {
     if (!provider.configured) continue;
+    if (disabled.has(provider.name)) continue;
     try {
       const messageId = await provider.send(options);
       console.log(`Email sent via ${provider.name} to ${options.to}: ${messageId}`);
@@ -224,17 +250,11 @@ async function sendEmail(options) {
     }
   }
 
-  // Last-resort fallback: Microsoft Graph API (app-only auth), replacing the
-  // previous raw-SMTP fallback.
-  try {
-    const messageId = await sendViaGraph(options);
-    console.log(`Email sent via Microsoft Graph to ${options.to}: ${messageId}`);
-    return { messageId, provider: 'graph' };
-  } catch (graphError) {
-    errors.push(`graph: ${graphError.message}`);
-    console.error(`Microsoft Graph failed for ${options.to}: ${graphError.message}`);
-    throw new Error(`All email providers failed. Errors: ${errors.join(' | ')}`);
-  }
+  throw new Error(
+    errors.length > 0
+      ? `All email providers failed. Errors: ${errors.join(' | ')}`
+      : 'No email providers are configured and enabled'
+  );
 }
 
-module.exports = { sendEmail, PROVIDER_META };
+module.exports = { sendEmail, PROVIDER_META, invalidateProviderSettingsCache };

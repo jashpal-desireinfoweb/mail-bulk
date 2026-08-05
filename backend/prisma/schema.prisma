@@ -103,3 +103,15 @@ model Template {
   @@map("templates")
 }
 
+// Per-provider on/off toggle for the email fallback chain, so specific
+// providers (e.g. "only send via Graph API") can be disabled from the
+// dashboard without touching env vars or redeploying. Absence of a row for
+// a given provider means enabled (default-on).
+model ProviderSetting {
+  provider  String   @id
+  enabled   Boolean  @default(true)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("provider_settings")
+}
+

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Upload, FileText, Send, AlertTriangle, Mail } from 'lucide-react';
 import StatsCard from '../components/StatsCard';
 import { uploadApi } from '../api/upload.api';
+import toast from 'react-hot-toast';
 import { DashboardStats, ProviderUsage } from '../types';
 
 export default function Dashboard() {
@@ -11,6 +12,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [providerUsage, setProviderUsage] = useState<ProviderUsage[]>([]);
   const [usageLoading, setUsageLoading] = useState(true);
+  const [providerEnabled, setProviderEnabled] = useState<Record<string, boolean>>({});
+  const [togglingProvider, setTogglingProvider] = useState<string | null>(null);
 
   useEffect(() => {
     uploadApi
@@ -24,7 +27,31 @@ export default function Dashboard() {
       .then((res) => setProviderUsage(res.data.usage))
       .catch(() => setProviderUsage([]))
       .finally(() => setUsageLoading(false));
+
+    uploadApi
+      .getProviderSettings()
+      .then((res) =>
+        setProviderEnabled(
+          Object.fromEntries(res.data.settings.map((s) => [s.provider, s.enabled]))
+        )
+      )
+      .catch(() => setProviderEnabled({}));
   }, []);
+
+  const handleToggleProvider = async (provider: string, nextEnabled: boolean) => {
+    setTogglingProvider(provider);
+    const previous = providerEnabled[provider];
+    setProviderEnabled((prev) => ({ ...prev, [provider]: nextEnabled }));
+    try {
+      await uploadApi.setProviderEnabled(provider, nextEnabled);
+      toast.success(`${provider.toUpperCase()} ${nextEnabled ? 'enabled' : 'disabled'}`);
+    } catch {
+      setProviderEnabled((prev) => ({ ...prev, [provider]: previous }));
+      toast.error(`Failed to update ${provider}`);
+    } finally {
+      setTogglingProvider(null);
+    }
+  };
 
   const admin = JSON.parse(localStorage.getItem('desire_admin') || '{}');
 
@@ -94,20 +121,21 @@ export default function Dashboard() {
                   <th className="px-6 py-3">Sent Today</th>
                   <th className="px-6 py-3">Daily Limit</th>
                   <th className="px-6 py-3">Remaining</th>
+                  <th className="px-6 py-3">Enabled</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/5 text-sm text-gray-300">
                 {usageLoading ? (
                   [...Array(3)].map((_, i) => (
                     <tr key={i} className="animate-pulse">
-                      <td className="px-6 py-3" colSpan={5}>
+                      <td className="px-6 py-3" colSpan={6}>
                         <div className="h-4 bg-white/10 rounded w-full" />
                       </td>
                     </tr>
                   ))
                 ) : providerUsage.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="text-center py-8 text-gray-500">
+                    <td colSpan={6} className="text-center py-8 text-gray-500">
                       <Mail className="w-8 h-8 mx-auto mb-2 opacity-30" />
                       Provider usage unavailable
                     </td>
@@ -115,6 +143,7 @@ export default function Dashboard() {
                 ) : (
                   providerUsage.map((p) => {
                     const isLow = p.remainingToday !== null && p.dailyLimit !== null && p.remainingToday / p.dailyLimit < 0.15;
+                    const enabled = providerEnabled[p.provider] !== false;
                     return (
                       <tr key={p.provider} className="hover:bg-white/[0.03] transition-colors">
                         <td className="px-6 py-3 font-semibold text-white uppercase">{p.provider}</td>
@@ -133,6 +162,23 @@ export default function Dashboard() {
                         <td className="px-6 py-3">{p.dailyLimit === null ? 'Unlimited' : p.dailyLimit}</td>
                         <td className={`px-6 py-3 font-semibold ${isLow ? 'text-red-400' : 'text-white'}`}>
                           {p.remainingToday === null ? '—' : p.remainingToday}
+                        </td>
+                        <td className="px-6 py-3">
+                          <button
+                            type="button"
+                            disabled={!p.configured || togglingProvider === p.provider}
+                            onClick={() => handleToggleProvider(p.provider, !enabled)}
+                            title={!p.configured ? 'Not configured — add its API key first' : undefined}
+                            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                              enabled ? 'bg-brand-500' : 'bg-white/10'
+                            }`}
+                          >
+                            <span
+                              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                enabled ? 'translate-x-6' : 'translate-x-1'
+                              }`}
+                            />
+                          </button>
                         </td>
                       </tr>
                     );

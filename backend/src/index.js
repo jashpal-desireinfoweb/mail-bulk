@@ -6,7 +6,7 @@ const XLSX = require('xlsx');
 const rateLimit = require('express-rate-limit');
 const { prisma, ContactStatus } = require('./prisma');
 const { generateToken, comparePassword, hashPassword, authenticate } = require('./auth');
-const { sendEmail, PROVIDER_META } = require('./email');
+const { sendEmail, PROVIDER_META, invalidateProviderSettingsCache } = require('./email');
 const { renderTemplate, invalidateTemplate } = require('./templates-service');
 const { recountUploadStats, checkUploadCompletion } = require('./upload-helpers');
 
@@ -455,6 +455,40 @@ apiRouter.get('/providers/usage', catchAsync(async (req, res) => {
   });
 
   return res.status(200).json({ usage, asOf: new Date().toISOString() });
+}));
+
+// GET /providers/settings — current enabled/disabled toggle per provider
+apiRouter.get('/providers/settings', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const rows = await prisma.providerSetting.findMany();
+  const disabledSet = new Set(rows.filter((r) => !r.enabled).map((r) => r.provider));
+  const settings = PROVIDER_META.map((p) => ({
+    provider: p.name,
+    configured: p.configured,
+    enabled: !disabledSet.has(p.name),
+  }));
+  return res.status(200).json({ settings });
+}));
+
+// PUT /providers/settings — toggle one provider on/off
+apiRouter.put('/providers/settings', catchAsync(async (req, res) => {
+  await authenticate(req);
+  const { provider, enabled } = req.body;
+  if (!provider || typeof enabled !== 'boolean') {
+    return res.status(400).json({ message: 'provider (string) and enabled (boolean) are required' });
+  }
+  if (!PROVIDER_META.some((p) => p.name === provider)) {
+    return res.status(400).json({ message: `Unknown provider '${provider}'` });
+  }
+
+  await prisma.providerSetting.upsert({
+    where: { provider },
+    update: { enabled },
+    create: { provider, enabled },
+  });
+  invalidateProviderSettingsCache();
+
+  return res.status(200).json({ message: `Provider '${provider}' ${enabled ? 'enabled' : 'disabled'}` });
 }));
 
 // GET /uploads
