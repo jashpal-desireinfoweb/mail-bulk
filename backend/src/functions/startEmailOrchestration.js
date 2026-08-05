@@ -4,6 +4,7 @@ const df = require('durable-functions');
 require('./emailOrchestrator');
 require('./getPendingContactsActivity');
 require('./sendEmailActivity');
+require('./getRandomDelayActivity');
 
 async function starterHandler(request, context) {
   const client = df.getClient(context);
