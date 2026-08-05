@@ -1,10 +1,10 @@
 const { EmailClient } = require('@azure/communication-email');
-const nodemailer = require('nodemailer');
 const { Resend } = require('resend');
 const sgMail = require('@sendgrid/mail');
 const brevo = require('@getbrevo/brevo');
 const Mailjet = require('node-mailjet');
 const { MailerSend, EmailParams, Sender, Recipient } = require('mailersend');
+const { ClientSecretCredential } = require('@azure/identity');
 
 const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM_ADDRESS || '';
 const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Desire Mail';
@@ -19,17 +19,19 @@ const MAILERSEND_API_KEY = process.env.MAILERSEND_API_KEY || '';
 const AZURE_COMMUNICATION_CONNECTION_STRING = process.env.AZURE_COMMUNICATION_CONNECTION_STRING || '';
 const AZURE_COMMUNICATION_FROM_EMAIL = process.env.AZURE_COMMUNICATION_FROM_EMAIL || 'donotreply@yourdomain.com';
 
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
-const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || 'Desire Mail';
+const MS_GRAPH_TENANT_ID = process.env.MS_GRAPH_TENANT_ID || '';
+const MS_GRAPH_CLIENT_ID = process.env.MS_GRAPH_CLIENT_ID || '';
+const MS_GRAPH_CLIENT_SECRET = process.env.MS_GRAPH_CLIENT_SECRET || '';
+const MS_GRAPH_SENDER_EMAIL = process.env.MS_GRAPH_SENDER_EMAIL || '';
 
 const isBrevoConfigured = BREVO_API_KEY.trim() !== '';
 const isResendConfigured = RESEND_API_KEY.trim() !== '';
 const isSendGridConfigured = SENDGRID_API_KEY.trim() !== '';
 const isMailjetConfigured = MAILJET_API_KEY.trim() !== '' && MAILJET_API_SECRET.trim() !== '';
 const isMailerSendConfigured = MAILERSEND_API_KEY.trim() !== '';
+const isGraphConfigured =
+  MS_GRAPH_TENANT_ID.trim() !== '' && MS_GRAPH_CLIENT_ID.trim() !== '' &&
+  MS_GRAPH_CLIENT_SECRET.trim() !== '' && MS_GRAPH_SENDER_EMAIL.trim() !== '';
 const isAzureConfigured =
   AZURE_COMMUNICATION_CONNECTION_STRING &&
   AZURE_COMMUNICATION_CONNECTION_STRING.trim() !== '' &&
@@ -41,26 +43,20 @@ if (isSendGridConfigured) sgMail.setApiKey(SENDGRID_API_KEY);
 const mailjetClient = isMailjetConfigured ? Mailjet.apiConnect(MAILJET_API_KEY, MAILJET_API_SECRET) : null;
 const mailerSendClient = isMailerSendConfigured ? new MailerSend({ apiKey: MAILERSEND_API_KEY }) : null;
 const azureEmailClient = isAzureConfigured ? new EmailClient(AZURE_COMMUNICATION_CONNECTION_STRING) : null;
+const graphCredential = isGraphConfigured
+  ? new ClientSecretCredential(MS_GRAPH_TENANT_ID, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET)
+  : null;
 
-function createDynamicTransporter(hostOverride) {
-  return nodemailer.createTransport({
-    host: hostOverride || SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    requireTLS: SMTP_PORT === 587,
-    family: 4,               // Force IPv4 lookup to prevent IPv6 socket blackholes
-    pool: false,             // Fresh connection per email for STARTTLS stability
-    connectionTimeout: 12000, // 12 seconds timeout for rapid failover
-    greetingTimeout: 12000,   // 12 seconds greeting timeout
-    socketTimeout: 30000,     // 30 seconds socket inactivity timeout
-    tls: {
-      rejectUnauthorized: false,
-    },
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-  });
+// Cache the app-only Graph token between sends (tokens are valid ~1hr) instead
+// of requesting a new one per email.
+let cachedGraphToken = null;
+async function getGraphToken() {
+  if (cachedGraphToken && cachedGraphToken.expiresOnTimestamp > Date.now() + 60000) {
+    return cachedGraphToken.token;
+  }
+  const tokenResponse = await graphCredential.getToken('https://graph.microsoft.com/.default');
+  cachedGraphToken = tokenResponse;
+  return tokenResponse.token;
 }
 
 async function sendViaBrevo(options) {
@@ -153,36 +149,41 @@ async function sendViaAzure(options) {
   return result.messageId || result.id || 'unknown';
 }
 
-async function sendViaSMTP(options) {
-  const fromAddress = SMTP_USER ? `${SMTP_FROM_NAME} <${SMTP_USER}>` : AZURE_COMMUNICATION_FROM_EMAIL;
+// Uses Microsoft Graph's application-permission sendMail endpoint (OAuth
+// client-credentials auth) instead of SMTP basic auth -- this sidesteps the
+// SMTP AUTH / Security Defaults / per-user MFA restrictions entirely, since
+// it's a first-party authenticated API call rather than an external SMTP
+// relay, which also avoids the same-tenant anti-spoofing quarantine issue
+// that blocked plain SMTP sends between desireinfoweb.in and .com earlier.
+async function sendViaGraph(options) {
+  if (!isGraphConfigured) throw new Error('Microsoft Graph is not configured');
+  const token = await getGraphToken();
 
-  try {
-    const primaryTransporter = createDynamicTransporter(SMTP_HOST);
-    const info = await primaryTransporter.sendMail({
-      from: fromAddress,
-      to: options.to,
-      subject: options.subject,
-      html: options.html,
-      text: options.text,
-    });
-    return info.messageId || 'unknown';
-  } catch (err) {
-    // If primary host timed out and using Office 365, attempt failover host
-    const isTimeout = err.message?.toLowerCase().includes('timeout') || err.code === 'ETIMEDOUT' || err.code === 'ESOCKET';
-    if (isTimeout && SMTP_HOST.includes('office365.com')) {
-      console.warn(`[SMTP Failover] Primary host ${SMTP_HOST} timed out for ${options.to}. Retrying via fallback host smtp-mail.outlook.com...`);
-      const fallbackTransporter = createDynamicTransporter('smtp-mail.outlook.com');
-      const info = await fallbackTransporter.sendMail({
-        from: fromAddress,
-        to: options.to,
-        subject: options.subject,
-        html: options.html,
-        text: options.text,
-      });
-      return info.messageId || 'unknown';
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(MS_GRAPH_SENDER_EMAIL)}/sendMail`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message: {
+          subject: options.subject,
+          body: { contentType: 'HTML', content: options.html },
+          toRecipients: [{ emailAddress: { address: options.to } }],
+        },
+        saveToSentItems: true,
+      }),
     }
-    throw err;
+  );
+
+  if (res.status !== 202) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Graph sendMail failed (${res.status}): ${body || res.statusText}`);
   }
+  // sendMail returns 202 Accepted with no body/message id
+  return 'accepted';
 }
 
 // Fallback chain, tried in order until one succeeds. Each provider's free tier
@@ -206,7 +207,7 @@ const PROVIDER_META = PROVIDER_CHAIN.map((p) => ({
   name: p.name,
   configured: p.configured,
   dailyLimit: p.dailyLimit,
-})).concat([{ name: 'smtp', configured: true, dailyLimit: null }]);
+})).concat([{ name: 'graph', configured: isGraphConfigured, dailyLimit: null }]);
 
 async function sendEmail(options) {
   const errors = [];
@@ -223,14 +224,15 @@ async function sendEmail(options) {
     }
   }
 
-  // Last-resort fallback: existing Office 365 SMTP transport
+  // Last-resort fallback: Microsoft Graph API (app-only auth), replacing the
+  // previous raw-SMTP fallback.
   try {
-    const messageId = await sendViaSMTP(options);
-    console.log(`Email sent via SMTP to ${options.to}: ${messageId}`);
-    return { messageId, provider: 'smtp' };
-  } catch (smtpError) {
-    errors.push(`smtp: ${smtpError.message}`);
-    console.error(`SMTP failed for ${options.to}: ${smtpError.message}`);
+    const messageId = await sendViaGraph(options);
+    console.log(`Email sent via Microsoft Graph to ${options.to}: ${messageId}`);
+    return { messageId, provider: 'graph' };
+  } catch (graphError) {
+    errors.push(`graph: ${graphError.message}`);
+    console.error(`Microsoft Graph failed for ${options.to}: ${graphError.message}`);
     throw new Error(`All email providers failed. Errors: ${errors.join(' | ')}`);
   }
 }
