@@ -42,6 +42,12 @@ model Upload {
   template     Template? @relation(fields: [templateId], references: [id])
   scheduledAt  DateTime? @map("scheduled_at")
 
+  // Durable Functions orchestration tracking — lets /unschedule actually
+  // terminate the running orchestration instance instead of only flipping
+  // this row's status (which the orchestration doesn't check before firing).
+  durableInstanceId   String? @map("durable_instance_id")
+  durableTerminateUrl String? @map("durable_terminate_url")
+
   @@index([status])
   @@index([scheduledAt])
   @@index([createdAt])

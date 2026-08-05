@@ -158,6 +158,16 @@ async function dispatchCampaignOrchestration(uploadId, templateId, scheduledAt =
       });
       const data = await res.json();
       console.log(`[Durable Starter Success] Upload ${uploadId}:`, data);
+
+      // Persist the instance id + its terminate URL so /unschedule can actually
+      // cancel the running orchestration later, instead of only flipping this
+      // row's status (which the orchestration doesn't check before firing).
+      if (data?.id && data?.terminatePostUri) {
+        await prisma.upload.update({
+          where: { id: uploadId },
+          data: { durableInstanceId: data.id, durableTerminateUrl: data.terminatePostUri },
+        }).catch((err) => console.error(`[Durable Instance Save Error] Upload ${uploadId}:`, err.message));
+      }
       return;
     } catch (err) {
       console.error(`[Durable Starter Error] Upload ${uploadId}:`, err.message);
@@ -829,6 +839,17 @@ apiRouter.post('/uploads/:id/schedule', catchAsync(async (req, res) => {
     return res.status(400).json({ message: e.message });
   }
 
+  // If this is an edit of an already-scheduled campaign, terminate the
+  // previous orchestration first -- otherwise both the old and new scheduled
+  // times would independently fire and send duplicates.
+  if (upload.status === 'scheduled' && upload.durableTerminateUrl) {
+    try {
+      await fetch(upload.durableTerminateUrl, { method: 'POST' });
+    } catch (err) {
+      console.error(`[Reschedule Terminate Error] Upload ${id}:`, err.message);
+    }
+  }
+
   const template = await prisma.template.findUnique({ where: { id: templateId } });
   if (!template) return res.status(404).json({ message: 'Template not found' });
 
@@ -901,11 +922,26 @@ apiRouter.post('/uploads/:id/unschedule', catchAsync(async (req, res) => {
     return res.status(400).json({ message: e.message });
   }
 
+  // Actually terminate the running Durable Functions orchestration -- without
+  // this, the orchestration's timer still fires and sends at the original
+  // scheduled time regardless of what this row's status says, since
+  // getPendingContactsActivity queries contacts by uploadId alone and doesn't
+  // check Upload.status before sending.
+  if (upload.durableTerminateUrl) {
+    try {
+      await fetch(upload.durableTerminateUrl, { method: 'POST' });
+    } catch (err) {
+      console.error(`[Unschedule Terminate Error] Upload ${id}:`, err.message);
+    }
+  }
+
   const updatedUpload = await prisma.upload.update({
     where: { id },
     data: {
       status: 'idle',
       scheduledAt: null,
+      durableInstanceId: null,
+      durableTerminateUrl: null,
     },
   });
 

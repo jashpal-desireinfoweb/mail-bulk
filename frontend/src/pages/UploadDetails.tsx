@@ -751,6 +751,18 @@ export default function UploadDetails() {
                         Please fill out **all** fields (Month, Day, Year, Hour, Minute, and AM/PM). If any part shows <span className="text-brand-300 font-mono">--</span>, the system will not receive a valid date.
                       </p>
                     </div>
+                    {scheduledAt && !isNaN(new Date(scheduledAt).getTime()) && (
+                      <div className="bg-brand-500/10 border border-brand-500/20 rounded-lg p-2.5 mt-1.5">
+                        <p className="text-xs text-gray-300">
+                          This will send on <span className="font-semibold text-white">
+                            {new Date(scheduledAt).toLocaleString(undefined, {
+                              weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+                              hour: 'numeric', minute: '2-digit', hour12: true,
+                            })}
+                          </span> — double-check AM/PM before confirming.
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
 
